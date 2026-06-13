@@ -222,6 +222,10 @@ Environment overrides
       Override the NVIDIA NIM endpoint for one run.
       Default: $DEFAULT_ENDPOINT
 
+  NVIDIACLAUDE_STREAM_PING_SECONDS
+      Send Anthropic SSE ping events while waiting for NVIDIA NIM stream
+      chunks. Default: 2. Set to 0 to disable.
+
   NVIDIACLAUDE_BIN_DIR
       Override the install directory used by install.sh.
 

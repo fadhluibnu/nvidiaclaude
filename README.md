@@ -119,11 +119,14 @@ nvidiaclaude command reference. Aliases for `commands`: `help`,
 NVIDIA_API_KEY=<KEY> nvidiaclaude
 NVIDIA_NIM_MODEL=<MODEL> nvidiaclaude
 NVIDIA_NIM_ENDPOINT=<URL> nvidiaclaude
+NVIDIACLAUDE_STREAM_PING_SECONDS=<SECONDS> nvidiaclaude
 NVIDIACLAUDE_BIN_DIR=<DIR> ./install.sh
 ```
 
 `NVIDIA_API_KEY` is saved for next time if no key is stored yet.
 `NVIDIA_NIM_MODEL` and `NVIDIA_NIM_ENDPOINT` override config for one run.
+`NVIDIACLAUDE_STREAM_PING_SECONDS` controls stream heartbeat pings while
+waiting for NVIDIA NIM chunks. Set it to `0` to disable pings.
 `NVIDIACLAUDE_BIN_DIR` changes where the shell installer writes files.
 
 ### Config Paths
@@ -217,6 +220,25 @@ To persist a model choice:
 
 ```bash
 nvidiaclaude change-model minimaxai/minimax-m3
+```
+
+## Streaming Heartbeat
+
+Some NVIDIA NIM models spend time in an internal thinking phase before the
+first visible token. During that wait, `nvidiaclaude` sends Anthropic-compatible
+SSE `ping` events so Claude Code can see that the stream is still active.
+
+By default, a ping is sent every 2 seconds while no NVIDIA NIM stream chunk is
+available. To change the interval for one run:
+
+```bash
+NVIDIACLAUDE_STREAM_PING_SECONDS=1 nvidiaclaude
+```
+
+To disable heartbeat pings:
+
+```bash
+NVIDIACLAUDE_STREAM_PING_SECONDS=0 nvidiaclaude
 ```
 
 ## What It Sets

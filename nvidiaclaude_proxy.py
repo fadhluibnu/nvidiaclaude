@@ -6,8 +6,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import sys
-import time
+import threading
 import uuid
 import urllib.error
 import urllib.parse
@@ -27,6 +28,7 @@ class ProxyConfig:
     api_key: str
     model: str
     timeout: float
+    stream_ping_seconds: float
 
 
 class ProviderError(Exception):
@@ -369,6 +371,23 @@ def provider_request(config: ProxyConfig, payload: dict[str, Any]) -> Any:
         raise ProviderError(502, str(error.reason)) from error
 
 
+def stream_provider(
+    config: ProxyConfig,
+    payload: dict[str, Any],
+    events: queue.Queue[tuple[str, Any]],
+) -> None:
+    try:
+        with provider_request(config, payload) as response:
+            for raw_line in response:
+                events.put(("line", raw_line))
+    except ProviderError as error:
+        events.put(("provider_error", error))
+    except Exception as error:
+        events.put(("exception", error))
+    finally:
+        events.put(("done", None))
+
+
 def estimate_tokens(body: dict[str, Any]) -> int:
     pieces: list[str] = [system_to_text(body.get("system"))]
     for message in body.get("messages") or []:
@@ -481,15 +500,6 @@ class NvidiaClaudeHandler(BaseHTTPRequestHandler):
         self.send_json(200, convert_openai_response(data, self.config.model))
 
     def handle_streaming_message(self, payload: dict[str, Any]) -> None:
-        try:
-            response = provider_request(self.config, payload)
-        except ProviderError as error:
-            self.send_error_json(error.status, f"NVIDIA NIM error: {error.message}")
-            return
-        except Exception as error:
-            self.send_error_json(502, f"NVIDIA NIM request failed: {error}")
-            return
-
         message_id = make_message_id()
         usage = {"input_tokens": 0, "output_tokens": 0}
         text_started = False
@@ -497,6 +507,13 @@ class NvidiaClaudeHandler(BaseHTTPRequestHandler):
         next_index = 0
         finish_reason: str | None = None
         tool_states: dict[int, dict[str, Any]] = {}
+        events: queue.Queue[tuple[str, Any]] = queue.Queue()
+        provider_thread = threading.Thread(
+            target=stream_provider,
+            args=(self.config, payload, events),
+            daemon=True,
+        )
+        provider_thread.start()
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -520,85 +537,121 @@ class NvidiaClaudeHandler(BaseHTTPRequestHandler):
         })
 
         try:
-            with response:
-                for raw_line in response:
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-                    if not line or line.startswith(":"):
-                        continue
-                    if not line.startswith("data:"):
-                        continue
-                    chunk_text = line[5:].strip()
-                    if chunk_text == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(chunk_text)
-                    except json.JSONDecodeError:
-                        continue
+            while True:
+                try:
+                    event_type, event_data = events.get(
+                        timeout=self.config.stream_ping_seconds
+                        if self.config.stream_ping_seconds > 0
+                        else None
+                    )
+                except queue.Empty:
+                    self.send_sse("ping", {"type": "ping"})
+                    continue
 
-                    if isinstance(chunk.get("usage"), dict):
-                        usage = anthropic_usage(chunk.get("usage"))
+                if event_type == "done":
+                    break
 
-                    choices = chunk.get("choices") or []
-                    if not choices:
-                        continue
-                    choice = choices[0]
-                    finish_reason = choice.get("finish_reason") or finish_reason
-                    delta = choice.get("delta") or {}
+                if event_type == "provider_error":
+                    error = event_data
+                    self.send_sse("error", {
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": f"NVIDIA NIM error: {error.message}",
+                        },
+                    })
+                    return
 
-                    content_delta = delta.get("content")
-                    if content_delta:
-                        if not text_started:
-                            text_index = next_index
-                            next_index += 1
-                            text_started = True
-                            self.send_sse("content_block_start", {
-                                "type": "content_block_start",
-                                "index": text_index,
-                                "content_block": {"type": "text", "text": ""},
-                            })
+                if event_type == "exception":
+                    self.send_sse("error", {
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": f"NVIDIA NIM stream failed: {event_data}",
+                        },
+                    })
+                    return
+
+                if event_type != "line":
+                    continue
+
+                line = event_data.decode("utf-8", errors="replace").strip()
+                if not line or line.startswith(":"):
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                chunk_text = line[5:].strip()
+                if chunk_text == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(chunk_text)
+                except json.JSONDecodeError:
+                    continue
+
+                if isinstance(chunk.get("usage"), dict):
+                    usage = anthropic_usage(chunk.get("usage"))
+
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                finish_reason = choice.get("finish_reason") or finish_reason
+                delta = choice.get("delta") or {}
+
+                content_delta = delta.get("content")
+                if content_delta:
+                    if not text_started:
+                        text_index = next_index
+                        next_index += 1
+                        text_started = True
+                        self.send_sse("content_block_start", {
+                            "type": "content_block_start",
+                            "index": text_index,
+                            "content_block": {"type": "text", "text": ""},
+                        })
+                    self.send_sse("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": text_index,
+                        "delta": {"type": "text_delta", "text": content_delta},
+                    })
+
+                for tool_call in delta.get("tool_calls") or []:
+                    openai_index = int(tool_call.get("index", len(tool_states)))
+                    state = tool_states.setdefault(openai_index, {
+                        "block_index": None,
+                        "id": None,
+                        "name": None,
+                    })
+                    if tool_call.get("id"):
+                        state["id"] = tool_call["id"]
+                    function = tool_call.get("function") or {}
+                    if function.get("name"):
+                        state["name"] = function["name"]
+
+                    if state["block_index"] is None and (state.get("id") or state.get("name")):
+                        state["block_index"] = next_index
+                        next_index += 1
+                        self.send_sse("content_block_start", {
+                            "type": "content_block_start",
+                            "index": state["block_index"],
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": state.get("id") or make_tool_id(),
+                                "name": state.get("name") or "tool",
+                                "input": {},
+                            },
+                        })
+
+                    arguments = function.get("arguments") or ""
+                    if arguments and state["block_index"] is not None:
                         self.send_sse("content_block_delta", {
                             "type": "content_block_delta",
-                            "index": text_index,
-                            "delta": {"type": "text_delta", "text": content_delta},
+                            "index": state["block_index"],
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": arguments,
+                            },
                         })
-
-                    for tool_call in delta.get("tool_calls") or []:
-                        openai_index = int(tool_call.get("index", len(tool_states)))
-                        state = tool_states.setdefault(openai_index, {
-                            "block_index": None,
-                            "id": None,
-                            "name": None,
-                        })
-                        if tool_call.get("id"):
-                            state["id"] = tool_call["id"]
-                        function = tool_call.get("function") or {}
-                        if function.get("name"):
-                            state["name"] = function["name"]
-
-                        if state["block_index"] is None and (state.get("id") or state.get("name")):
-                            state["block_index"] = next_index
-                            next_index += 1
-                            self.send_sse("content_block_start", {
-                                "type": "content_block_start",
-                                "index": state["block_index"],
-                                "content_block": {
-                                    "type": "tool_use",
-                                    "id": state.get("id") or make_tool_id(),
-                                    "name": state.get("name") or "tool",
-                                    "input": {},
-                                },
-                            })
-
-                        arguments = function.get("arguments") or ""
-                        if arguments and state["block_index"] is not None:
-                            self.send_sse("content_block_delta", {
-                                "type": "content_block_delta",
-                                "index": state["block_index"],
-                                "delta": {
-                                    "type": "input_json_delta",
-                                    "partial_json": arguments,
-                                },
-                            })
 
             if text_started and text_index is not None:
                 self.send_sse("content_block_stop", {
@@ -653,6 +706,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def env_float(name: str, default: float) -> float:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return default
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        return default
+
+
 def main() -> int:
     args = parse_args()
     api_key = os.environ.get("NVIDIA_API_KEY", "").strip()
@@ -665,6 +728,7 @@ def main() -> int:
         api_key=api_key,
         model=os.environ.get("NVIDIA_NIM_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL,
         timeout=args.timeout,
+        stream_ping_seconds=env_float("NVIDIACLAUDE_STREAM_PING_SECONDS", 2.0),
     )
 
     server = ThreadingHTTPServer((args.host, args.port), make_handler(config))
