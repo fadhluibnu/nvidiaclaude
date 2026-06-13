@@ -11,23 +11,40 @@ requests to NVIDIA NIM.
 
 ## Install
 
-### macOS / Linux
+### Stable: main
+
+macOS / Linux:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/fadhluibnu/nvidiaclaude/main/install.sh | bash
 ```
 
-Installs `nvidiaclaude` and `nvidiaclaude_proxy.py` into `~/.local/bin`. If
-that directory is not on your `PATH`, the installer prints the line to add.
-
-### Windows (PowerShell)
+Windows PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/fadhluibnu/nvidiaclaude/main/install.ps1 | iex
 ```
 
-Installs `nvidiaclaude` into `%LOCALAPPDATA%\Programs\nvidiaclaude` and adds it
-to your user `PATH`. Open a new terminal afterward.
+### Beta: dev
+
+macOS / Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/fadhluibnu/nvidiaclaude/dev/install.sh | bash
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/fadhluibnu/nvidiaclaude/dev/install.ps1 | iex
+```
+
+The beta install uses the `dev` branch, so the `dev` branch must be pushed to
+GitHub before those URLs work.
+
+Installs `nvidiaclaude` and `nvidiaclaude_proxy.py` into `~/.local/bin` on
+macOS/Linux, or `%LOCALAPPDATA%\Programs\nvidiaclaude` on Windows. If the
+install directory is not on your `PATH`, the installer prints the next step.
 
 ## Use
 
@@ -43,6 +60,78 @@ Every run after that uses the same key. Any arguments pass through to `claude`:
 nvidiaclaude "refactor this module"
 nvidiaclaude --help
 ```
+
+Show the nvidiaclaude-specific command reference:
+
+```bash
+nvidiaclaude commands
+```
+
+## Command Reference
+
+### Start
+
+```bash
+nvidiaclaude [CLAUDE_ARGS...]
+```
+
+Starts Claude Code through the local NVIDIA NIM adapter. Extra arguments pass
+through to the `claude` CLI.
+
+### API Key
+
+```bash
+nvidiaclaude config <KEY>
+nvidiaclaude change-key [KEY]
+nvidiaclaude reset
+```
+
+`config` saves or replaces the NVIDIA API key without a prompt. `change-key`
+can prompt securely when no key is provided. `reset` removes the stored key
+without removing the stored model.
+
+### Model
+
+```bash
+nvidiaclaude change-model <MODEL>
+nvidiaclaude set-model <MODEL>
+nvidiaclaude model
+nvidiaclaude reset-model
+```
+
+Use `change-model` or `set-model` to persist a model. Use `model` to show the
+model new runs will use. Use `reset-model` to return to the default model.
+
+### Maintenance
+
+```bash
+nvidiaclaude update
+nvidiaclaude commands
+```
+
+`update` re-runs the installer from the main branch. `commands` prints the
+nvidiaclaude command reference. Aliases for `commands`: `help`,
+`--help-nvidiaclaude`.
+
+### Environment Overrides
+
+```bash
+NVIDIA_API_KEY=<KEY> nvidiaclaude
+NVIDIA_NIM_MODEL=<MODEL> nvidiaclaude
+NVIDIA_NIM_ENDPOINT=<URL> nvidiaclaude
+NVIDIACLAUDE_BIN_DIR=<DIR> ./install.sh
+```
+
+`NVIDIA_API_KEY` is saved for next time if no key is stored yet.
+`NVIDIA_NIM_MODEL` and `NVIDIA_NIM_ENDPOINT` override config for one run.
+`NVIDIACLAUDE_BIN_DIR` changes where the shell installer writes files.
+
+### Config Paths
+
+| Platform      | Path                                               |
+| ------------- | -------------------------------------------------- |
+| macOS/Linux   | `~/.config/nvidiaclaude/config`                    |
+| Windows       | `%APPDATA%\nvidiaclaude\config`                    |
 
 ### Ways to provide the key
 
@@ -62,6 +151,37 @@ nvidiaclaude reset             # delete the stored key
 ```
 
 `config`, `set-key`, and `change` are accepted as aliases for `change-key`.
+
+## Manage Your Model
+
+Change the stored NVIDIA NIM model without reinstalling:
+
+```bash
+nvidiaclaude change-model <MODEL>
+nvidiaclaude set-model <MODEL>
+```
+
+Show the model that new runs will use:
+
+```bash
+nvidiaclaude model
+```
+
+Return to the default model:
+
+```bash
+nvidiaclaude reset-model
+```
+
+The model is resolved in this order:
+
+1. `NVIDIA_NIM_MODEL` environment variable for a one-off run.
+2. The stored config file.
+3. The default model, `minimaxai/minimax-m3`.
+
+Changing the stored model affects the next `nvidiaclaude` run. A process that
+is already running keeps the model that was selected when its local proxy
+started.
 
 ## Update
 
@@ -91,6 +211,12 @@ You can override either setting for a single run:
 ```bash
 NVIDIA_NIM_MODEL="minimaxai/minimax-m3" nvidiaclaude
 NVIDIA_NIM_ENDPOINT="https://integrate.api.nvidia.com/v1/chat/completions" nvidiaclaude
+```
+
+To persist a model choice:
+
+```bash
+nvidiaclaude change-model minimaxai/minimax-m3
 ```
 
 ## What It Sets

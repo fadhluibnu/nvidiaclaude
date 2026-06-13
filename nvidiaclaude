@@ -39,19 +39,6 @@ script_dir() {
   cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd
 }
 
-save_key() {
-  local key
-  key="$(trim "$1")"
-  if [ -z "$key" ]; then
-    say "Refusing to save an empty key."
-    return 1
-  fi
-  mkdir -p "$CONFIG_DIR"
-  ( umask 077; printf 'NVIDIA_API_KEY=%s\n' "$key" > "$CONFIG_FILE" )
-  chmod 600 "$CONFIG_FILE"
-  say "Key saved to $CONFIG_FILE"
-}
-
 read_config_value() {
   local name="$1" line
   [ -f "$CONFIG_FILE" ] || return 0
@@ -61,6 +48,85 @@ read_config_value() {
     esac
   done < "$CONFIG_FILE"
   return 0
+}
+
+set_config_value() {
+  local name="$1" value="$2" tmp line wrote=0
+  value="$(trim "$value")"
+  if [ -z "$value" ]; then
+    say "Refusing to save an empty value for $name."
+    return 1
+  fi
+  mkdir -p "$CONFIG_DIR"
+  tmp="$(mktemp "$CONFIG_DIR/config.XXXXXX")"
+  if [ -f "$CONFIG_FILE" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        "$name"=*)
+          if [ "$wrote" -eq 0 ]; then
+            printf '%s=%s\n' "$name" "$value" >> "$tmp"
+            wrote=1
+          fi
+          ;;
+        *)
+          printf '%s\n' "$line" >> "$tmp"
+          ;;
+      esac
+    done < "$CONFIG_FILE"
+  fi
+  if [ "$wrote" -eq 0 ]; then
+    printf '%s=%s\n' "$name" "$value" >> "$tmp"
+  fi
+  chmod 600 "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
+}
+
+remove_config_value() {
+  local name="$1" tmp line
+  [ -f "$CONFIG_FILE" ] || return 0
+  tmp="$(mktemp "$CONFIG_DIR/config.XXXXXX")"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "$name"=*) ;;
+      *) printf '%s\n' "$line" >> "$tmp" ;;
+    esac
+  done < "$CONFIG_FILE"
+  chmod 600 "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
+}
+
+save_key() {
+  local key
+  key="$(trim "$1")"
+  if [ -z "$key" ]; then
+    say "Refusing to save an empty key."
+    return 1
+  fi
+  set_config_value NVIDIA_API_KEY "$key"
+  say "Key saved to $CONFIG_FILE"
+}
+
+save_model() {
+  local model
+  model="$(trim "$1")"
+  if [ -z "$model" ]; then
+    say "Refusing to save an empty model."
+    return 1
+  fi
+  set_config_value NVIDIA_NIM_MODEL "$model"
+  say "Model saved to $CONFIG_FILE"
+}
+
+configured_model() {
+  local model
+  model="$(read_config_value NVIDIA_NIM_MODEL)"
+  if [ -n "${NVIDIA_NIM_MODEL:-}" ]; then
+    printf '%s' "$(trim "$NVIDIA_NIM_MODEL")"
+  elif [ -n "$model" ]; then
+    printf '%s' "$(trim "$model")"
+  else
+    printf '%s' "$DEFAULT_MODEL"
+  fi
 }
 
 read_secret() {
@@ -98,6 +164,74 @@ interactive_setup() {
   done
   save_key "$key"
   say ""
+}
+
+show_commands() {
+  cat <<EOF
+nvidiaclaude command reference
+
+Start
+  nvidiaclaude [CLAUDE_ARGS...]
+      Start Claude Code through the local NVIDIA NIM adapter.
+      Any extra arguments are passed through to the claude CLI.
+
+API key
+  nvidiaclaude config <KEY>
+      Save or replace the NVIDIA API key without an interactive prompt.
+
+  nvidiaclaude change-key [KEY]
+      Change the stored NVIDIA API key. If KEY is omitted, nvidiaclaude asks
+      for it securely.
+      Aliases: config, set-key, change
+
+  nvidiaclaude reset
+      Remove the stored NVIDIA API key. The stored model is kept.
+
+Model
+  nvidiaclaude change-model <MODEL>
+      Save the NVIDIA NIM model used by future nvidiaclaude runs.
+
+  nvidiaclaude set-model <MODEL>
+      Alias for change-model.
+
+  nvidiaclaude model
+      Show the model new runs will use after applying env/config/default
+      precedence.
+
+  nvidiaclaude reset-model
+      Remove the stored model and return to the default model:
+      $DEFAULT_MODEL
+
+Maintenance
+  nvidiaclaude update
+      Re-run the installer from the main branch.
+      Aliases: upgrade
+
+  nvidiaclaude commands
+      Show this command reference.
+      Aliases: help, --help-nvidiaclaude
+
+Environment overrides
+  NVIDIA_API_KEY
+      Use this API key if no key is stored yet. It will be saved for next time.
+
+  NVIDIA_NIM_MODEL
+      Override the configured model for one run.
+
+  NVIDIA_NIM_ENDPOINT
+      Override the NVIDIA NIM endpoint for one run.
+      Default: $DEFAULT_ENDPOINT
+
+  NVIDIACLAUDE_BIN_DIR
+      Override the install directory used by install.sh.
+
+Config paths
+  macOS/Linux:
+      ${CONFIG_FILE}
+
+  Windows:
+      %APPDATA%\\nvidiaclaude\\config
+EOF
 }
 
 find_python() {
@@ -174,6 +308,10 @@ start_proxy() {
 }
 
 case "${1:-}" in
+  commands|help|--help-nvidiaclaude)
+    show_commands
+    exit 0
+    ;;
   config|--config|set-key|--set-key|change|--change|change-key|--change-key)
     if [ "${2:-}" != "" ]; then
       save_key "$2"
@@ -183,8 +321,26 @@ case "${1:-}" in
     say "Done. Run 'nvidiaclaude' to start."
     exit 0
     ;;
+  change-model|--change-model|set-model|--set-model)
+    if [ "${2:-}" = "" ]; then
+      say "Usage: nvidiaclaude change-model <MODEL>"
+      exit 1
+    fi
+    save_model "$2"
+    say "Done. New runs will use model: $(configured_model)"
+    exit 0
+    ;;
+  model|--model|current-model|--current-model)
+    printf '%s\n' "$(configured_model)"
+    exit 0
+    ;;
+  reset-model|--reset-model)
+    remove_config_value NVIDIA_NIM_MODEL
+    say "Stored model removed. New runs will use default model: $DEFAULT_MODEL"
+    exit 0
+    ;;
   reset|--reset)
-    rm -f "$CONFIG_FILE"
+    remove_config_value NVIDIA_API_KEY
     say "Stored key removed."
     exit 0
     ;;
@@ -221,7 +377,7 @@ fi
 
 export NVIDIA_API_KEY="$KEY"
 export NVIDIA_NIM_ENDPOINT="${NVIDIA_NIM_ENDPOINT:-$DEFAULT_ENDPOINT}"
-export NVIDIA_NIM_MODEL="${NVIDIA_NIM_MODEL:-$DEFAULT_MODEL}"
+export NVIDIA_NIM_MODEL="$(configured_model)"
 
 trap cleanup_proxy EXIT INT TERM
 PORT="$(start_proxy)"
