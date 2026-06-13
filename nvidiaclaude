@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+#
+# nvidiaclaude - run Claude Code against NVIDIA NIM through a local adapter.
+#
+# Key resolution order:
+#   1. `nvidiaclaude config [KEY]` - set/replace the stored key
+#   2. stored config file          - set on a previous run
+#   3. NVIDIA_API_KEY env var      - used and saved for next time
+#   4. interactive prompt          - asks for the key if needed
+#
+set -euo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nvidiaclaude"
+CONFIG_FILE="$CONFIG_DIR/config"
+DEFAULT_ENDPOINT="https://integrate.api.nvidia.com/v1/chat/completions"
+DEFAULT_MODEL="minimaxai/minimax-m3"
+LOCAL_AUTH_TOKEN="nvidiaclaude-local"
+
+say() { printf '%s\n' "$*" >&2; }
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+script_dir() {
+  local source="${BASH_SOURCE[0]}"
+  while [ -L "$source" ]; do
+    local dir
+    dir="$(cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd)"
+    source="$(readlink "$source")"
+    case "$source" in
+      /*) ;;
+      *) source="$dir/$source" ;;
+    esac
+  done
+  cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd
+}
+
+save_key() {
+  local key
+  key="$(trim "$1")"
+  if [ -z "$key" ]; then
+    say "Refusing to save an empty key."
+    return 1
+  fi
+  mkdir -p "$CONFIG_DIR"
+  ( umask 077; printf 'NVIDIA_API_KEY=%s\n' "$key" > "$CONFIG_FILE" )
+  chmod 600 "$CONFIG_FILE"
+  say "Key saved to $CONFIG_FILE"
+}
+
+read_config_value() {
+  local name="$1" line
+  [ -f "$CONFIG_FILE" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "$name"=*) printf '%s' "${line#*=}"; return 0 ;;
+    esac
+  done < "$CONFIG_FILE"
+  return 0
+}
+
+read_secret() {
+  local prompt="$1" value=""
+  printf '%s' "$prompt" >&2
+  if IFS= read -rs value 2>/dev/null < /dev/tty; then
+    :
+  else
+    IFS= read -rs value || true
+  fi
+  printf '\n' >&2
+  printf '%s' "$value"
+}
+
+interactive_setup() {
+  say ""
+  say "+------------------------------------------+"
+  say "|  nvidiaclaude - first-time setup         |"
+  say "+------------------------------------------+"
+  say ""
+  say "Claude Code will run against NVIDIA NIM."
+  say "You only need to enter your NVIDIA API key once."
+  say "Get a key from NVIDIA API Catalog."
+  say ""
+  local key="" tries=0
+  while :; do
+    key="$(trim "$(read_secret 'NVIDIA API key: ')")"
+    [ -n "$key" ] && break
+    tries=$((tries + 1))
+    say "Key can't be empty."
+    if [ "$tries" -ge 3 ]; then
+      say "Aborting after 3 empty attempts."
+      exit 1
+    fi
+  done
+  save_key "$key"
+  say ""
+}
+
+find_python() {
+  if command -v python3 >/dev/null 2>&1; then
+    command -v python3
+    return 0
+  fi
+  if command -v python >/dev/null 2>&1; then
+    command -v python
+    return 0
+  fi
+  return 1
+}
+
+cleanup_proxy() {
+  if [ -n "${PROXY_PID:-}" ] && kill -0 "$PROXY_PID" >/dev/null 2>&1; then
+    kill "$PROXY_PID" >/dev/null 2>&1 || true
+    wait "$PROXY_PID" >/dev/null 2>&1 || true
+  fi
+  if [ -n "${TMP_DIR:-}" ] && [ -d "$TMP_DIR" ]; then
+    rm -rf "$TMP_DIR"
+  fi
+}
+
+start_proxy() {
+  local python proxy_dir proxy_file ready_file log_file attempts port
+  python="$(find_python)" || {
+    say "Python 3 not found on PATH."
+    say "Install Python 3 before running nvidiaclaude."
+    exit 127
+  }
+
+  proxy_dir="$(script_dir)"
+  proxy_file="$proxy_dir/nvidiaclaude_proxy.py"
+  if [ ! -f "$proxy_file" ]; then
+    say "Proxy file not found: $proxy_file"
+    say "Reinstall nvidiaclaude so nvidiaclaude_proxy.py is installed next to the command."
+    exit 1
+  fi
+
+  TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/nvidiaclaude.XXXXXX")"
+  ready_file="$TMP_DIR/ready"
+  log_file="$TMP_DIR/proxy.log"
+
+  "$python" "$proxy_file" \
+    --host 127.0.0.1 \
+    --port 0 \
+    --ready-file "$ready_file" \
+    > "$log_file" 2>&1 &
+  PROXY_PID=$!
+
+  attempts=0
+  while [ ! -s "$ready_file" ]; do
+    if ! kill -0 "$PROXY_PID" >/dev/null 2>&1; then
+      say "nvidiaclaude proxy failed to start."
+      [ -s "$log_file" ] && sed 's/^/  /' "$log_file" >&2
+      exit 1
+    fi
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 200 ]; then
+      say "Timed out waiting for nvidiaclaude proxy."
+      [ -s "$log_file" ] && sed 's/^/  /' "$log_file" >&2
+      exit 1
+    fi
+    sleep 0.05
+  done
+
+  port="$(tr -d '\r\n ' < "$ready_file")"
+  if [ -z "$port" ]; then
+    say "nvidiaclaude proxy did not report a port."
+    exit 1
+  fi
+  printf '%s' "$port"
+}
+
+case "${1:-}" in
+  config|--config|set-key|--set-key|change|--change|change-key|--change-key)
+    if [ "${2:-}" != "" ]; then
+      save_key "$2"
+    else
+      interactive_setup
+    fi
+    say "Done. Run 'nvidiaclaude' to start."
+    exit 0
+    ;;
+  reset|--reset)
+    rm -f "$CONFIG_FILE"
+    say "Stored key removed."
+    exit 0
+    ;;
+  update|--update|upgrade|--upgrade)
+    say "Updating nvidiaclaude to the latest version..."
+    curl -fsSL "https://raw.githubusercontent.com/fadhluibnu/nvidiaclaude/main/install.sh" | bash
+    exit $?
+    ;;
+esac
+
+KEY="$(read_config_value NVIDIA_API_KEY)"
+
+if [ -z "${KEY:-}" ] && [ -n "${NVIDIA_API_KEY:-}" ]; then
+  KEY="$(trim "$NVIDIA_API_KEY")"
+  say "Using NVIDIA_API_KEY from environment; saving for next time."
+  save_key "$KEY" || true
+fi
+
+if [ -z "${KEY:-}" ]; then
+  interactive_setup
+  KEY="$(read_config_value NVIDIA_API_KEY)"
+fi
+
+if [ -z "${KEY:-}" ]; then
+  say "No API key available. Run 'nvidiaclaude config' to set one."
+  exit 1
+fi
+
+if ! command -v claude >/dev/null 2>&1; then
+  say "claude CLI not found on PATH."
+  say "Install Claude Code first: https://docs.claude.com/en/docs/claude-code"
+  exit 127
+fi
+
+export NVIDIA_API_KEY="$KEY"
+export NVIDIA_NIM_ENDPOINT="${NVIDIA_NIM_ENDPOINT:-$DEFAULT_ENDPOINT}"
+export NVIDIA_NIM_MODEL="${NVIDIA_NIM_MODEL:-$DEFAULT_MODEL}"
+
+trap cleanup_proxy EXIT INT TERM
+PORT="$(start_proxy)"
+
+export ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT"
+export ANTHROPIC_AUTH_TOKEN="$LOCAL_AUTH_TOKEN"
+export ANTHROPIC_MODEL="$NVIDIA_NIM_MODEL"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="$NVIDIA_NIM_MODEL"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="$NVIDIA_NIM_MODEL"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="$NVIDIA_NIM_MODEL"
+export ANTHROPIC_SMALL_FAST_MODEL="$NVIDIA_NIM_MODEL"
+export CLAUDE_CODE_SUBAGENT_MODEL="$NVIDIA_NIM_MODEL"
+export CLAUDE_CODE_EFFORT_LEVEL="max"
+
+claude --dangerously-skip-permissions "$@"
+exit $?
