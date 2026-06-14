@@ -3,7 +3,7 @@
 Run [Claude Code](https://docs.claude.com/en/docs/claude-code) against
 NVIDIA NIM through a local Anthropic-compatible adapter.
 
-Install once, enter your NVIDIA API key once, and then run `nvidiaclaude`.
+Install once, add one or more NVIDIA API tokens, and then run `nvidiaclaude`.
 The command starts a local proxy, points Claude Code at it, and forwards the
 requests to NVIDIA NIM.
 
@@ -30,17 +30,19 @@ irm https://raw.githubusercontent.com/fadhluibnu/nvidiaclaude/main/install.ps1 |
 macOS / Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/fadhluibnu/nvidiaclaude/dev/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/fadhluibnu/nvidiaclaude/dev/install.sh | NVIDIACLAUDE_INSTALL_REF=dev bash
 ```
 
 Windows PowerShell:
 
 ```powershell
+$env:NVIDIACLAUDE_INSTALL_REF = 'dev'
 irm https://raw.githubusercontent.com/fadhluibnu/nvidiaclaude/dev/install.ps1 | iex
 ```
 
-The beta install uses the `dev` branch, so the `dev` branch must be pushed to
-GitHub before those URLs work.
+The installer stores the selected channel, so `nvidiaclaude update` keeps using
+the same branch. The beta install uses the `dev` branch, so the `dev` branch
+must be pushed to GitHub before those URLs work.
 
 Installs `nvidiaclaude` and `nvidiaclaude_proxy.py` into `~/.local/bin` on
 macOS/Linux, or `%LOCALAPPDATA%\Programs\nvidiaclaude` on Windows. If the
@@ -48,13 +50,14 @@ install directory is not on your `PATH`, the installer prints the next step.
 
 ## Use
 
-First run asks for your NVIDIA API key and saves it:
+First run asks for your NVIDIA API token and saves it:
 
 ```bash
 nvidiaclaude
 ```
 
-Every run after that uses the same key. Any arguments pass through to `claude`:
+Every run after that uses the stored token list. Any arguments pass through to
+`claude`:
 
 ```bash
 nvidiaclaude "refactor this module"
@@ -83,12 +86,17 @@ through to the `claude` CLI.
 ```bash
 nvidiaclaude config <KEY>
 nvidiaclaude change-key [KEY]
+nvidiaclaude token add [KEY]
+nvidiaclaude token list
+nvidiaclaude token remove <INDEX>
+nvidiaclaude token clear
 nvidiaclaude reset
 ```
 
-`config` saves or replaces the NVIDIA API key without a prompt. `change-key`
-can prompt securely when no key is provided. `reset` removes the stored key
-without removing the stored model.
+`config` and `change-key` replace the stored token list with one token.
+`token add` appends another token for automatic failover. `token list` masks
+stored values, `token remove` deletes one token by index, and `token clear` or
+`reset` removes all stored tokens without removing the stored model.
 
 ### Model
 
@@ -109,24 +117,31 @@ nvidiaclaude update
 nvidiaclaude commands
 ```
 
-`update` re-runs the installer from the main branch. `commands` prints the
-nvidiaclaude command reference. Aliases for `commands`: `help`,
+`update` re-runs the installer from the selected install branch. `commands`
+prints the nvidiaclaude command reference. Aliases for `commands`: `help`,
 `--help-nvidiaclaude`.
 
 ### Environment Overrides
 
 ```bash
 NVIDIA_API_KEY=<KEY> nvidiaclaude
+NVIDIA_API_KEYS=<KEY1>,<KEY2> nvidiaclaude
 NVIDIA_NIM_MODEL=<MODEL> nvidiaclaude
 NVIDIA_NIM_ENDPOINT=<URL> nvidiaclaude
 NVIDIACLAUDE_STREAM_PING_SECONDS=<SECONDS> nvidiaclaude
+NVIDIACLAUDE_TOKEN_COOLDOWN_SECONDS=<SECONDS> nvidiaclaude
+NVIDIACLAUDE_INSTALL_REF=dev nvidiaclaude update
 NVIDIACLAUDE_BIN_DIR=<DIR> ./install.sh
 ```
 
-`NVIDIA_API_KEY` is saved for next time if no key is stored yet.
+`NVIDIA_API_KEY` or `NVIDIA_API_KEYS` is saved for next time if no token is
+stored yet.
 `NVIDIA_NIM_MODEL` and `NVIDIA_NIM_ENDPOINT` override config for one run.
 `NVIDIACLAUDE_STREAM_PING_SECONDS` controls stream heartbeat pings while
 waiting for NVIDIA NIM chunks. Set it to `0` to disable pings.
+`NVIDIACLAUDE_TOKEN_COOLDOWN_SECONDS` controls how long a failed token is
+avoided after rate-limit or token auth errors. Default: `60`.
+`NVIDIACLAUDE_INSTALL_REF` overrides the install/update branch for one run.
 `NVIDIACLAUDE_BIN_DIR` changes where the shell installer writes files.
 
 ### Config Paths
@@ -136,24 +151,44 @@ waiting for NVIDIA NIM chunks. Set it to `0` to disable pings.
 | macOS/Linux   | `~/.config/nvidiaclaude/config`                    |
 | Windows       | `%APPDATA%\nvidiaclaude\config`                    |
 
-### Ways to provide the key
+### Ways to Provide Tokens
 
-The key is resolved in this order:
+Tokens are resolved in this order:
 
-1. `nvidiaclaude config <KEY>` - set it inline, no prompt.
-2. The stored config file - set on a previous run.
-3. `NVIDIA_API_KEY` environment variable - used and saved for next time.
+1. Stored config file.
+2. `NVIDIA_API_KEYS` environment variable, comma-separated.
+3. `NVIDIA_API_KEY` environment variable.
 4. Interactive prompt - asked for automatically if none of the above is set.
 
-## Manage Your Key
+## Manage Your Tokens
 
 ```bash
-nvidiaclaude change-key        # change the stored key interactively
-nvidiaclaude change-key <KEY>  # change the key without a prompt
-nvidiaclaude reset             # delete the stored key
+nvidiaclaude token add         # add a token interactively
+nvidiaclaude token add <KEY>   # add a token without a prompt
+nvidiaclaude token list        # show masked stored tokens
+nvidiaclaude token remove 2    # delete token number 2
+nvidiaclaude token clear       # delete all stored tokens
+nvidiaclaude reset             # alias for clearing stored tokens
 ```
 
 `config`, `set-key`, and `change` are accepted as aliases for `change-key`.
+They replace the stored token list with a single token for compatibility with
+older installs.
+
+## Auto Failover
+
+When multiple tokens are configured, the local proxy automatically switches to
+the next token for token-specific failures:
+
+- HTTP `429`
+- quota or rate-limit messages
+- invalid, expired, unauthorized, or forbidden token responses
+
+For non-streaming requests, retry is transparent to Claude Code. For streaming
+responses, retry is safe before content output starts. If a token fails after
+partial streaming output, the proxy returns an SSE error for that response,
+marks the token as limited when possible, and uses another token on the next
+request.
 
 ## Manage Your Model
 
@@ -192,12 +227,19 @@ started.
 nvidiaclaude update
 ```
 
-| Platform      | Where the key is stored                            |
+The update command uses the branch selected during installation. Override it
+for a one-off update:
+
+```bash
+NVIDIACLAUDE_INSTALL_REF=dev nvidiaclaude update
+```
+
+| Platform      | Where tokens are stored                            |
 | ------------- | -------------------------------------------------- |
 | macOS/Linux   | `~/.config/nvidiaclaude/config` with perms `600`   |
 | Windows       | `%APPDATA%\nvidiaclaude\config` with user-only ACL |
 
-It is stored in plaintext on your machine. Treat it like any other local
+Tokens are stored in plaintext on your machine. Treat them like any other local
 credential.
 
 ## NVIDIA NIM Settings
@@ -274,6 +316,7 @@ macOS / Linux:
 ```bash
 rm ~/.local/bin/nvidiaclaude
 rm ~/.local/bin/nvidiaclaude_proxy.py
+rm ~/.local/bin/.nvidiaclaude-install-ref
 rm -rf ~/.config/nvidiaclaude
 ```
 

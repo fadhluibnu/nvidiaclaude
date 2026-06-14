@@ -9,6 +9,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import uuid
 import urllib.error
 import urllib.parse
@@ -25,10 +26,12 @@ DEFAULT_MODEL = "minimaxai/minimax-m3"
 @dataclass(frozen=True)
 class ProxyConfig:
     endpoint: str
-    api_key: str
+    api_keys: list[str]
     model: str
     timeout: float
     stream_ping_seconds: float
+    token_cooldown_seconds: float
+    token_manager: "TokenManager"
 
 
 class ProviderError(Exception):
@@ -36,6 +39,33 @@ class ProviderError(Exception):
         super().__init__(message)
         self.status = status
         self.message = message
+
+
+class TokenManager:
+    def __init__(self, token_count: int, cooldown_seconds: float):
+        self.token_count = token_count
+        self.cooldown_seconds = cooldown_seconds
+        self.active_index = 0
+        self.cooldown_until = [0.0 for _ in range(token_count)]
+        self.lock = threading.Lock()
+
+    def candidates(self) -> list[int]:
+        with self.lock:
+            now = time.time()
+            order = list(range(self.active_index, self.token_count)) + list(range(0, self.active_index))
+            available = [index for index in order if self.cooldown_until[index] <= now]
+            return available or order
+
+    def mark_success(self, index: int) -> None:
+        with self.lock:
+            self.active_index = index
+            self.cooldown_until[index] = 0.0
+
+    def mark_token_limited(self, index: int) -> None:
+        with self.lock:
+            self.cooldown_until[index] = time.time() + self.cooldown_seconds
+            if self.active_index == index and self.token_count > 0:
+                self.active_index = (index + 1) % self.token_count
 
 
 def json_dumps(data: Any) -> str:
@@ -57,6 +87,49 @@ def normalize_endpoint(endpoint: str) -> str:
     if endpoint.endswith("/v1"):
         return endpoint + "/chat/completions"
     return endpoint.rstrip("/") + "/v1/chat/completions"
+
+
+def split_api_keys(value: str) -> list[str]:
+    keys: list[str] = []
+    for part in value.split(","):
+        part = part.strip()
+        if part and part not in keys:
+            keys.append(part)
+    return keys
+
+
+def load_api_keys_from_env() -> list[str]:
+    multi = os.environ.get("NVIDIA_API_KEYS", "").strip()
+    if multi:
+        return split_api_keys(multi)
+    single = os.environ.get("NVIDIA_API_KEY", "").strip()
+    return [single] if single else []
+
+
+def is_token_failover_error(error: ProviderError) -> bool:
+    message = error.message.lower()
+    token_phrases = (
+        "rate limit",
+        "rate_limit",
+        "ratelimit",
+        "too many requests",
+        "quota",
+        "limit exceeded",
+        "limits exceeded",
+        "exceeded your current quota",
+        "insufficient quota",
+        "token expired",
+        "invalid token",
+        "invalid api key",
+        "api key",
+        "unauthorized",
+        "forbidden",
+    )
+    if error.status == 429:
+        return True
+    if error.status in (401, 403):
+        return True
+    return any(phrase in message for phrase in token_phrases)
 
 
 def parse_json_object(value: str) -> dict[str, Any]:
@@ -349,13 +422,13 @@ def convert_openai_response(data: dict[str, Any], model: str) -> dict[str, Any]:
     }
 
 
-def provider_request(config: ProxyConfig, payload: dict[str, Any]) -> Any:
+def provider_request(config: ProxyConfig, payload: dict[str, Any], token_index: int) -> Any:
     body = json_dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         config.endpoint,
         data=body,
         headers={
-            "Authorization": f"Bearer {config.api_key}",
+            "Authorization": f"Bearer {config.api_keys[token_index]}",
             "Content-Type": "application/json",
             "Accept": "text/event-stream" if payload.get("stream") else "application/json",
             "User-Agent": "nvidiaclaude/1.0",
@@ -371,19 +444,45 @@ def provider_request(config: ProxyConfig, payload: dict[str, Any]) -> Any:
         raise ProviderError(502, str(error.reason)) from error
 
 
+def provider_request_with_failover(config: ProxyConfig, payload: dict[str, Any]) -> tuple[Any, int]:
+    attempts: list[str] = []
+    for token_index in config.token_manager.candidates():
+        try:
+            response = provider_request(config, payload, token_index)
+            config.token_manager.mark_success(token_index)
+            return response, token_index
+        except ProviderError as error:
+            if not is_token_failover_error(error):
+                raise
+            config.token_manager.mark_token_limited(token_index)
+            attempts.append(f"token #{token_index + 1}: HTTP {error.status}")
+            print(
+                f"NVIDIA token #{token_index + 1} failed with HTTP {error.status}; trying next token.",
+                file=sys.stderr,
+            )
+
+    detail = "; ".join(attempts) if attempts else "no token attempts were made"
+    raise ProviderError(
+        429,
+        f"All configured NVIDIA API tokens failed or are rate limited ({detail}).",
+    )
+
+
 def stream_provider(
     config: ProxyConfig,
     payload: dict[str, Any],
     events: queue.Queue[tuple[str, Any]],
 ) -> None:
+    token_index: int | None = None
     try:
-        with provider_request(config, payload) as response:
+        response, token_index = provider_request_with_failover(config, payload)
+        with response:
             for raw_line in response:
-                events.put(("line", raw_line))
+                events.put(("line", (raw_line, token_index)))
     except ProviderError as error:
         events.put(("provider_error", error))
     except Exception as error:
-        events.put(("exception", error))
+        events.put(("exception", (error, token_index)))
     finally:
         events.put(("done", None))
 
@@ -448,7 +547,11 @@ class NvidiaClaudeHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urllib.parse.urlparse(self.path).path
         if path in ("/", "/healthz"):
-            self.send_json(200, {"ok": True, "model": self.config.model})
+            self.send_json(200, {
+                "ok": True,
+                "model": self.config.model,
+                "token_count": len(self.config.api_keys),
+            })
             return
         if path in ("/v1/models", "/models"):
             self.send_json(200, {
@@ -488,7 +591,8 @@ class NvidiaClaudeHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            with provider_request(self.config, payload) as response:
+            response, _token_index = provider_request_with_failover(self.config, payload)
+            with response:
                 data = json.loads(response.read().decode("utf-8"))
         except ProviderError as error:
             self.send_error_json(error.status, f"NVIDIA NIM error: {error.message}")
@@ -563,11 +667,12 @@ class NvidiaClaudeHandler(BaseHTTPRequestHandler):
                     return
 
                 if event_type == "exception":
+                    error, _token_index = event_data
                     self.send_sse("error", {
                         "type": "error",
                         "error": {
                             "type": "api_error",
-                            "message": f"NVIDIA NIM stream failed: {event_data}",
+                            "message": f"NVIDIA NIM stream failed: {error}",
                         },
                     })
                     return
@@ -575,7 +680,8 @@ class NvidiaClaudeHandler(BaseHTTPRequestHandler):
                 if event_type != "line":
                     continue
 
-                line = event_data.decode("utf-8", errors="replace").strip()
+                raw_line, token_index = event_data
+                line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line or line.startswith(":"):
                     continue
                 if not line.startswith("data:"):
@@ -587,6 +693,25 @@ class NvidiaClaudeHandler(BaseHTTPRequestHandler):
                     chunk = json.loads(chunk_text)
                 except json.JSONDecodeError:
                     continue
+
+                if isinstance(chunk.get("error"), dict):
+                    error_data = chunk["error"]
+                    message = str(error_data.get("message") or error_data)
+                    try:
+                        status = int(error_data.get("status") or error_data.get("status_code") or 0)
+                    except (TypeError, ValueError):
+                        status = 0
+                    provider_error = ProviderError(status, message)
+                    if token_index is not None and is_token_failover_error(provider_error):
+                        self.config.token_manager.mark_token_limited(token_index)
+                    self.send_sse("error", {
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": f"NVIDIA NIM stream failed: {message}",
+                        },
+                    })
+                    return
 
                 if isinstance(chunk.get("usage"), dict):
                     usage = anthropic_usage(chunk.get("usage"))
@@ -703,6 +828,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--ready-file")
     parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument("--token-cooldown-seconds", type=float)
     return parser.parse_args()
 
 
@@ -718,17 +844,24 @@ def env_float(name: str, default: float) -> float:
 
 def main() -> int:
     args = parse_args()
-    api_key = os.environ.get("NVIDIA_API_KEY", "").strip()
-    if not api_key:
-        print("NVIDIA_API_KEY is required.", file=sys.stderr)
+    api_keys = load_api_keys_from_env()
+    if not api_keys:
+        print("NVIDIA_API_KEY or NVIDIA_API_KEYS is required.", file=sys.stderr)
         return 1
+    token_cooldown_seconds = (
+        max(0.0, args.token_cooldown_seconds)
+        if args.token_cooldown_seconds is not None
+        else env_float("NVIDIACLAUDE_TOKEN_COOLDOWN_SECONDS", 60.0)
+    )
 
     config = ProxyConfig(
         endpoint=normalize_endpoint(os.environ.get("NVIDIA_NIM_ENDPOINT", DEFAULT_ENDPOINT)),
-        api_key=api_key,
+        api_keys=api_keys,
         model=os.environ.get("NVIDIA_NIM_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL,
         timeout=args.timeout,
         stream_ping_seconds=env_float("NVIDIACLAUDE_STREAM_PING_SECONDS", 2.0),
+        token_cooldown_seconds=token_cooldown_seconds,
+        token_manager=TokenManager(len(api_keys), token_cooldown_seconds),
     )
 
     server = ThreadingHTTPServer((args.host, args.port), make_handler(config))
@@ -739,7 +872,10 @@ def main() -> int:
         with open(args.ready_file, "w", encoding="ascii") as ready:
             ready.write(str(port))
 
-    print(f"nvidiaclaude proxy listening on {args.host}:{port}", file=sys.stderr)
+    print(
+        f"nvidiaclaude proxy listening on {args.host}:{port} with {len(api_keys)} token(s)",
+        file=sys.stderr,
+    )
     try:
         server.serve_forever(poll_interval=0.2)
     except KeyboardInterrupt:

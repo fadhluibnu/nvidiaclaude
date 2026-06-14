@@ -6,9 +6,11 @@
 #
 set -euo pipefail
 
-REPO_RAW="https://raw.githubusercontent.com/fadhluibnu/nvidiaclaude/main"
+INSTALL_REF="${NVIDIACLAUDE_INSTALL_REF:-main}"
+REPO_RAW="https://raw.githubusercontent.com/fadhluibnu/nvidiaclaude/$INSTALL_REF"
 CMD_NAME="nvidiaclaude"
 PROXY_NAME="nvidiaclaude_proxy.py"
+REF_NAME=".nvidiaclaude-install-ref"
 BIN_DIR="${NVIDIACLAUDE_BIN_DIR:-$HOME/.local/bin}"
 
 mkdir -p "$BIN_DIR"
@@ -26,9 +28,11 @@ else
 fi
 chmod +x "$BIN_DIR/$CMD_NAME"
 chmod +x "$BIN_DIR/$PROXY_NAME"
+printf '%s\n' "$INSTALL_REF" > "$BIN_DIR/$REF_NAME"
 
 echo "Installed: $BIN_DIR/$CMD_NAME"
 echo "Installed: $BIN_DIR/$PROXY_NAME"
+echo "Channel: $INSTALL_REF"
 
 case ":$PATH:" in
   *":$BIN_DIR:"*)
