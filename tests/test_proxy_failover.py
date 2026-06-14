@@ -1,5 +1,6 @@
 import contextlib
 import io
+import os
 import queue
 import sys
 import time
@@ -59,6 +60,53 @@ def make_config(
 
 
 class FailoverTests(unittest.TestCase):
+    def test_normalize_endpoint_accepts_full_chat_completions_url(self):
+        endpoint = "https://api.tokenrouter.com/v1/chat/completions"
+
+        self.assertEqual(proxy.normalize_endpoint(endpoint), endpoint)
+
+    def test_normalize_endpoint_appends_chat_completions_to_v1_base(self):
+        self.assertEqual(
+            proxy.normalize_endpoint("https://api.tokenrouter.com/v1"),
+            "https://api.tokenrouter.com/v1/chat/completions",
+        )
+
+    def test_normalize_endpoint_appends_v1_chat_completions_to_provider_root(self):
+        self.assertEqual(
+            proxy.normalize_endpoint("https://api.tokenrouter.com"),
+            "https://api.tokenrouter.com/v1/chat/completions",
+        )
+
+    def test_load_api_keys_prefers_generic_env_over_legacy_env(self):
+        env = {
+            "NVIDIACLAUDE_API_KEYS": " generic-a, generic-b ",
+            "NVIDIA_API_KEYS": "legacy-a,legacy-b",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(proxy.load_api_keys_from_env(), ["generic-a", "generic-b"])
+
+    def test_load_endpoint_prefers_generic_env_over_legacy_env(self):
+        env = {
+            "NVIDIACLAUDE_API_ENDPOINT": "https://api.tokenrouter.com/v1",
+            "NVIDIA_NIM_ENDPOINT": "https://legacy.example/v1",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(
+                proxy.load_endpoint_from_env(),
+                "https://api.tokenrouter.com/v1",
+            )
+
+    def test_load_model_prefers_generic_env_over_legacy_env(self):
+        env = {
+            "NVIDIACLAUDE_MODEL": "provider/model",
+            "NVIDIA_NIM_MODEL": "legacy/model",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(proxy.load_model_from_env(), "provider/model")
+
     def test_split_api_keys_trims_and_deduplicates(self):
         self.assertEqual(proxy.split_api_keys(" a, b ,,a , c "), ["a", "b", "c"])
 
@@ -107,7 +155,7 @@ class FailoverTests(unittest.TestCase):
                 proxy.provider_request_with_failover(config, {"stream": False})
 
         self.assertEqual(raised.exception.status, 401)
-        self.assertIn("All configured NVIDIA API tokens failed", raised.exception.message)
+        self.assertIn("All configured provider API tokens failed", raised.exception.message)
         self.assertEqual(calls, [0, 1])
 
     def test_provider_request_with_failover_switches_token_after_429(self):
