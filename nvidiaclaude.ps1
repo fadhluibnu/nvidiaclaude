@@ -1,10 +1,10 @@
 # nvidiaclaude - run Claude Code against NVIDIA NIM through a local adapter.
 #
 # Key resolution order:
-#   1. `nvidiaclaude config [KEY]` - set/replace the stored key
-#   2. stored config file          - set on a previous run
-#   3. $env:NVIDIA_API_KEY         - used and saved for next time
-#   4. interactive prompt          - asks for the key if needed
+#   1. stored config file          - set by config/token subcommands
+#   2. $env:NVIDIA_API_KEYS        - comma-separated keys, saved for next time
+#   3. $env:NVIDIA_API_KEY         - single key, saved for next time
+#   4. interactive prompt          - asks for a key if needed
 
 $ErrorActionPreference = 'Stop'
 
@@ -13,15 +13,124 @@ $ConfigFile      = Join-Path $ConfigDir 'config'
 $DefaultEndpoint = 'https://integrate.api.nvidia.com/v1/chat/completions'
 $DefaultModel    = 'minimaxai/minimax-m3'
 $LocalAuthToken  = 'nvidiaclaude-local'
+$DefaultInstallRef = 'main'
 
 function Save-Key([string]$Key) {
-  $Key = $Key.Trim()
-  if ([string]::IsNullOrEmpty($Key)) {
-    Write-Host 'Refusing to save an empty key.'
-    return
+  Save-Keys @($Key) | Out-Null
+}
+
+function Save-Keys([string[]]$Keys) {
+  $clean = @()
+  foreach ($key in $Keys) {
+    if ($null -eq $key) { continue }
+    $key = $key.Trim()
+    if ($key -and ($clean -notcontains $key)) {
+      $clean += $key
+    }
   }
-  Set-ConfigValue 'NVIDIA_API_KEY' $Key
-  Write-Host "Key saved to $ConfigFile"
+  if ($clean.Count -eq 0) {
+    Write-Host 'Refusing to save an empty token list.'
+    return $false
+  }
+
+  New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
+  $lines = @()
+  if (Test-Path $ConfigFile) {
+    foreach ($line in Get-Content $ConfigFile) {
+      if (($line -notlike 'NVIDIA_API_KEY=*') -and ($line -notlike 'NVIDIA_API_KEYS=*')) {
+        $lines += $line
+      }
+    }
+  }
+  foreach ($key in $clean) {
+    $lines += "NVIDIA_API_KEY=$key"
+  }
+  Set-Content -Path $ConfigFile -Value $lines -Encoding ASCII
+  try {
+    $acl  = New-Object System.Security.AccessControl.FileSecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+      "$env:USERDOMAIN\$env:USERNAME", 'FullControl', 'Allow')
+    $acl.AddAccessRule($rule)
+    Set-Acl -Path $ConfigFile -AclObject $acl
+  } catch { }
+
+  if ($clean.Count -eq 1) {
+    Write-Host "Token saved to $ConfigFile"
+  } else {
+    Write-Host "$($clean.Count) tokens saved to $ConfigFile"
+  }
+  return $true
+}
+
+function Remove-AllKeys {
+  if (-not (Test-Path $ConfigFile)) { return }
+  $lines = @()
+  foreach ($line in Get-Content $ConfigFile) {
+    if (($line -notlike 'NVIDIA_API_KEY=*') -and ($line -notlike 'NVIDIA_API_KEYS=*')) {
+      $lines += $line
+    }
+  }
+  Set-Content -Path $ConfigFile -Value $lines -Encoding ASCII
+}
+
+function Split-KeyCsv([string]$Value) {
+  $keys = @()
+  if (-not $Value) { return $keys }
+  foreach ($part in $Value.Split(',')) {
+    $part = $part.Trim()
+    if ($part -and ($keys -notcontains $part)) {
+      $keys += $part
+    }
+  }
+  return $keys
+}
+
+function Get-ConfigKeys {
+  $keys = @()
+  if (-not (Test-Path $ConfigFile)) { return $keys }
+  foreach ($line in Get-Content $ConfigFile) {
+    if ($line -like 'NVIDIA_API_KEY=*') {
+      $value = $line.Substring('NVIDIA_API_KEY='.Length).Trim()
+      if ($value -and ($keys -notcontains $value)) {
+        $keys += $value
+      }
+    } elseif ($line -like 'NVIDIA_API_KEYS=*') {
+      foreach ($value in (Split-KeyCsv $line.Substring('NVIDIA_API_KEYS='.Length))) {
+        if ($value -and ($keys -notcontains $value)) {
+          $keys += $value
+        }
+      }
+    }
+  }
+  return $keys
+}
+
+function Get-EnvKeys {
+  if ($env:NVIDIA_API_KEYS) {
+    return Split-KeyCsv $env:NVIDIA_API_KEYS
+  }
+  if ($env:NVIDIA_API_KEY) {
+    $key = $env:NVIDIA_API_KEY.Trim()
+    if ($key) { return @($key) }
+  }
+  return @()
+}
+
+function Mask-Key([string]$Key) {
+  if (-not $Key -or $Key.Length -le 10) { return '****' }
+  return $Key.Substring(0, 6) + '...' + $Key.Substring($Key.Length - 4)
+}
+
+function Get-InstallRef {
+  if ($env:NVIDIACLAUDE_INSTALL_REF) { return $env:NVIDIACLAUDE_INSTALL_REF.Trim() }
+  $scriptDir = Split-Path -Parent $PSCommandPath
+  $refFile = Join-Path $scriptDir '.nvidiaclaude-install-ref'
+  if (Test-Path $refFile) {
+    $ref = (Get-Content $refFile -Raw).Trim()
+    if ($ref) { return $ref }
+  }
+  return $DefaultInstallRef
 }
 
 function Set-ConfigValue([string]$Name, [string]$Value) {
@@ -105,7 +214,7 @@ function Invoke-Setup {
   Write-Host ''
   Write-Host 'Claude Code will run against NVIDIA NIM.'
   Write-Host 'You only need to enter your NVIDIA API key once.'
-  Write-Host 'Get a key from NVIDIA API Catalog.'
+  Write-Host 'Additional tokens can be added later with: nvidiaclaude token add'
   Write-Host ''
   for ($i = 0; $i -lt 3; $i++) {
     $secure = Read-Host -AsSecureString 'NVIDIA API key'
@@ -118,6 +227,92 @@ function Invoke-Setup {
   }
   Write-Host 'Aborting after 3 empty attempts.'
   exit 1
+}
+
+function Show-TokenUsage {
+  Write-Host 'Usage:'
+  Write-Host '  nvidiaclaude token add [KEY]'
+  Write-Host '  nvidiaclaude token list'
+  Write-Host '  nvidiaclaude token remove <INDEX>'
+  Write-Host '  nvidiaclaude token clear'
+}
+
+function Invoke-TokenCommand([string[]]$CommandArgs) {
+  $action = if ($CommandArgs.Count -ge 2) { $CommandArgs[1] } else { 'list' }
+  switch -Regex ($action) {
+    '^(add)$' {
+      if ($CommandArgs.Count -ge 3) {
+        $key = $CommandArgs[2].Trim()
+      } else {
+        $secure = Read-Host -AsSecureString 'NVIDIA API key'
+        $bstr   = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+        $key    = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        $key = $key.Trim()
+      }
+      if (-not $key) {
+        Write-Host "Token can't be empty."
+        exit 1
+      }
+      $keys = @(Get-ConfigKeys)
+      if ($keys -contains $key) {
+        Write-Host "Token already exists: $(Mask-Key $key)"
+        exit 0
+      }
+      $keys += $key
+      Save-Keys $keys | Out-Null
+      exit 0
+    }
+    '^(list|ls)$' {
+      $keys = @(Get-ConfigKeys)
+      if ($keys.Count -eq 0) {
+        Write-Host 'No stored NVIDIA API tokens.'
+      } else {
+        for ($i = 0; $i -lt $keys.Count; $i++) {
+          Write-Host "$($i + 1). $(Mask-Key $keys[$i])"
+        }
+      }
+      exit 0
+    }
+    '^(remove|rm|delete)$' {
+      if ($CommandArgs.Count -lt 3 -or $CommandArgs[2] -notmatch '^[0-9]+$') {
+        Write-Host 'Token index must be a positive number.'
+        Show-TokenUsage
+        exit 1
+      }
+      $index = [int]$CommandArgs[2]
+      $keys = @(Get-ConfigKeys)
+      if ($index -lt 1 -or $index -gt $keys.Count) {
+        Write-Host "No token exists at index $index."
+        exit 1
+      }
+      $next = @()
+      for ($i = 0; $i -lt $keys.Count; $i++) {
+        if (($i + 1) -ne $index) { $next += $keys[$i] }
+      }
+      if ($next.Count -eq 0) {
+        Remove-AllKeys
+        Write-Host 'All stored tokens removed.'
+      } else {
+        Save-Keys $next | Out-Null
+      }
+      exit 0
+    }
+    '^(clear|reset)$' {
+      Remove-AllKeys
+      Write-Host 'All stored tokens removed.'
+      exit 0
+    }
+    '^(help|--help|-h)$' {
+      Show-TokenUsage
+      exit 0
+    }
+    default {
+      Write-Host "Unknown token command: $action"
+      Show-TokenUsage
+      exit 1
+    }
+  }
 }
 
 function Get-PythonCommand {
@@ -212,15 +407,27 @@ Start
 
 API key
   nvidiaclaude config <KEY>
-      Save or replace the NVIDIA API key without an interactive prompt.
+      Replace the stored token list with one NVIDIA API token.
 
   nvidiaclaude change-key [KEY]
-      Change the stored NVIDIA API key. If KEY is omitted, nvidiaclaude asks
+      Replace the stored token list. If KEY is omitted, nvidiaclaude asks
       for it securely.
       Aliases: config, set-key, change
 
+  nvidiaclaude token add [KEY]
+      Add another NVIDIA API token for automatic failover.
+
+  nvidiaclaude token list
+      List saved tokens with masked values.
+
+  nvidiaclaude token remove <INDEX>
+      Remove one saved token by index from token list.
+
+  nvidiaclaude token clear
+      Remove all saved tokens. The stored model is kept.
+
   nvidiaclaude reset
-      Remove the stored NVIDIA API key. The stored model is kept.
+      Remove all saved tokens. The stored model is kept.
 
 Model
   nvidiaclaude change-model <MODEL>
@@ -239,7 +446,7 @@ Model
 
 Maintenance
   nvidiaclaude update
-      Re-run the installer from the main branch.
+      Re-run the installer from the selected install branch.
       Aliases: upgrade
 
   nvidiaclaude commands
@@ -248,7 +455,11 @@ Maintenance
 
 Environment overrides
   NVIDIA_API_KEY
-      Use this API key if no key is stored yet. It will be saved for next time.
+      Use this token if no token is stored yet. It will be saved for next time.
+
+  NVIDIA_API_KEYS
+      Comma-separated token list if no token is stored yet. It will be saved
+      for next time.
 
   NVIDIA_NIM_MODEL
       Override the configured model for one run.
@@ -256,6 +467,26 @@ Environment overrides
   NVIDIA_NIM_ENDPOINT
       Override the NVIDIA NIM endpoint for one run.
       Default: $DefaultEndpoint
+
+  NVIDIACLAUDE_STREAM_PING_SECONDS
+      Send Anthropic SSE ping events while waiting for NVIDIA NIM stream
+      chunks. Default: 2. Set to 0 to disable.
+
+  NVIDIACLAUDE_TOKEN_COOLDOWN_SECONDS
+      Seconds to avoid a token after a token-specific failure. Default: 60.
+
+  NVIDIACLAUDE_RATE_LIMIT_RPM
+      Maximum NVIDIA requests per shared rate-limit window. Default: 38.
+      Set to 0 to disable proactive throttling.
+
+  NVIDIACLAUDE_RATE_LIMIT_SCOPE
+      Rate-limit scope: global or per-token. Default: global.
+
+  NVIDIACLAUDE_RATE_LIMIT_WINDOW_SECONDS
+      Rate-limit window length in seconds. Default: 60.
+
+  NVIDIACLAUDE_INSTALL_REF
+      Override the install/update branch for one install or update.
 
   NVIDIACLAUDE_BIN_DIR
       Override the install directory used by install.sh.
@@ -280,6 +511,10 @@ if ($args.Count -ge 1) {
       Write-Host "Done. Run 'nvidiaclaude' to start."
       exit 0
     }
+    '^(token|tokens)$' {
+      Invoke-TokenCommand $args
+      exit 0
+    }
     '^(change-model|--change-model|set-model|--set-model)$' {
       if ($args.Count -lt 2) {
         Write-Host 'Usage: nvidiaclaude change-model <MODEL>'
@@ -299,33 +534,37 @@ if ($args.Count -ge 1) {
       exit 0
     }
     '^(reset|--reset)$' {
-      Remove-ConfigValue 'NVIDIA_API_KEY'
-      Write-Host 'Stored key removed.'
+      Remove-AllKeys
+      Write-Host 'All stored tokens removed.'
       exit 0
     }
     '^(update|--update|upgrade|--upgrade)$' {
-      Write-Host 'Updating nvidiaclaude to the latest version...'
-      irm 'https://raw.githubusercontent.com/fadhluibnu/nvidiaclaude/main/install.ps1' | iex
+      $ref = Get-InstallRef
+      Write-Host "Updating nvidiaclaude from '$ref'..."
+      $env:NVIDIACLAUDE_INSTALL_REF = $ref
+      irm "https://raw.githubusercontent.com/fadhluibnu/nvidiaclaude/$ref/install.ps1" | iex
       exit 0
     }
   }
 }
 
-$key = Get-ConfigValue 'NVIDIA_API_KEY'
+$keys = @(Get-ConfigKeys)
 
-if (-not $key -and $env:NVIDIA_API_KEY) {
-  $key = $env:NVIDIA_API_KEY.Trim()
-  Write-Host 'Using NVIDIA_API_KEY from environment; saving for next time.'
-  Save-Key $key
+if ($keys.Count -eq 0) {
+  $keys = @(Get-EnvKeys)
+  if ($keys.Count -gt 0) {
+    Write-Host 'Using NVIDIA API token(s) from environment; saving for next time.'
+    Save-Keys $keys | Out-Null
+  }
 }
 
-if (-not $key) {
+if ($keys.Count -eq 0) {
   Invoke-Setup
-  $key = Get-ConfigValue 'NVIDIA_API_KEY'
+  $keys = @(Get-ConfigKeys)
 }
 
-if (-not $key) {
-  Write-Host "No API key available. Run 'nvidiaclaude config' to set one."
+if ($keys.Count -eq 0) {
+  Write-Host "No API token available. Run 'nvidiaclaude token add' to set one."
   exit 1
 }
 
@@ -335,7 +574,8 @@ if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
   exit 127
 }
 
-$env:NVIDIA_API_KEY = $key
+$env:NVIDIA_API_KEY = $keys[0]
+$env:NVIDIA_API_KEYS = ($keys -join ',')
 if (-not $env:NVIDIA_NIM_ENDPOINT) { $env:NVIDIA_NIM_ENDPOINT = $DefaultEndpoint }
 $env:NVIDIA_NIM_MODEL = Get-ConfiguredModel
 

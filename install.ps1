@@ -4,7 +4,8 @@
 
 $ErrorActionPreference = 'Stop'
 
-$Repo = 'https://raw.githubusercontent.com/fadhluibnu/nvidiaclaude/main'
+$Ref = if ($env:NVIDIACLAUDE_INSTALL_REF) { $env:NVIDIACLAUDE_INSTALL_REF.Trim() } else { 'main' }
+$Repo = "https://raw.githubusercontent.com/fadhluibnu/nvidiaclaude/$Ref"
 $Dest = Join-Path $env:LOCALAPPDATA 'Programs\nvidiaclaude'
 
 New-Item -ItemType Directory -Force -Path $Dest | Out-Null
@@ -12,6 +13,7 @@ New-Item -ItemType Directory -Force -Path $Dest | Out-Null
 Write-Host "Installing nvidiaclaude to $Dest ..."
 Invoke-WebRequest -UseBasicParsing "$Repo/nvidiaclaude.ps1" -OutFile (Join-Path $Dest 'nvidiaclaude.ps1')
 Invoke-WebRequest -UseBasicParsing "$Repo/nvidiaclaude_proxy.py" -OutFile (Join-Path $Dest 'nvidiaclaude_proxy.py')
+Set-Content -Path (Join-Path $Dest '.nvidiaclaude-install-ref') -Value $Ref -Encoding ASCII
 
 # A .cmd shim so `nvidiaclaude` works from cmd.exe and PowerShell alike.
 $shim = @'
@@ -31,4 +33,5 @@ if ($userPath -notlike "*$Dest*") {
   Write-Host 'Open a NEW terminal for it to take effect.'
 }
 
+Write-Host "Channel: $Ref"
 Write-Host 'Installed. Run: nvidiaclaude'

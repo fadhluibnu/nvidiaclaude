@@ -3,10 +3,10 @@
 # nvidiaclaude - run Claude Code against NVIDIA NIM through a local adapter.
 #
 # Key resolution order:
-#   1. `nvidiaclaude config [KEY]` - set/replace the stored key
-#   2. stored config file          - set on a previous run
-#   3. NVIDIA_API_KEY env var      - used and saved for next time
-#   4. interactive prompt          - asks for the key if needed
+#   1. stored config file          - set by config/token subcommands
+#   2. NVIDIA_API_KEYS env var     - comma-separated keys, saved for next time
+#   3. NVIDIA_API_KEY env var      - single key, saved for next time
+#   4. interactive prompt          - asks for a key if needed
 #
 set -euo pipefail
 
@@ -15,6 +15,7 @@ CONFIG_FILE="$CONFIG_DIR/config"
 DEFAULT_ENDPOINT="https://integrate.api.nvidia.com/v1/chat/completions"
 DEFAULT_MODEL="minimaxai/minimax-m3"
 LOCAL_AUTH_TOKEN="nvidiaclaude-local"
+DEFAULT_INSTALL_REF="main"
 
 say() { printf '%s\n' "$*" >&2; }
 
@@ -39,6 +40,23 @@ script_dir() {
   cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd
 }
 
+install_ref() {
+  local ref_file ref
+  ref_file="$(script_dir)/.nvidiaclaude-install-ref"
+  if [ -n "${NVIDIACLAUDE_INSTALL_REF:-}" ]; then
+    printf '%s' "$(trim "$NVIDIACLAUDE_INSTALL_REF")"
+  elif [ -f "$ref_file" ]; then
+    ref="$(tr -d '\r\n ' < "$ref_file")"
+    if [ -n "$ref" ]; then
+      printf '%s' "$ref"
+    else
+      printf '%s' "$DEFAULT_INSTALL_REF"
+    fi
+  else
+    printf '%s' "$DEFAULT_INSTALL_REF"
+  fi
+}
+
 read_config_value() {
   local name="$1" line
   [ -f "$CONFIG_FILE" ] || return 0
@@ -48,6 +66,66 @@ read_config_value() {
     esac
   done < "$CONFIG_FILE"
   return 0
+}
+
+parse_key_csv() {
+  local value="$1" part old_ifs
+  local parts=()
+  old_ifs="$IFS"
+  IFS=','
+  read -r -a parts <<< "$value"
+  IFS="$old_ifs"
+  for part in "${parts[@]}"; do
+    part="$(trim "$part")"
+    [ -n "$part" ] && printf '%s\n' "$part"
+  done
+}
+
+add_unique_token() {
+  local token="$1" existing
+  token="$(trim "$token")"
+  [ -n "$token" ] || return 0
+  for existing in "${TOKENS[@]:-}"; do
+    [ "$existing" = "$token" ] && return 0
+  done
+  TOKENS+=("$token")
+}
+
+read_config_keys() {
+  local line value
+  [ -f "$CONFIG_FILE" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      NVIDIA_API_KEY=*)
+        value="$(trim "${line#NVIDIA_API_KEY=}")"
+        [ -n "$value" ] && printf '%s\n' "$value"
+        ;;
+      NVIDIA_API_KEYS=*)
+        parse_key_csv "${line#NVIDIA_API_KEYS=}"
+        ;;
+    esac
+  done < "$CONFIG_FILE"
+  return 0
+}
+
+load_config_keys() {
+  local key
+  TOKENS=()
+  while IFS= read -r key || [ -n "$key" ]; do
+    add_unique_token "$key"
+  done < <(read_config_keys)
+}
+
+load_env_keys() {
+  local key
+  TOKENS=()
+  if [ -n "${NVIDIA_API_KEYS:-}" ]; then
+    while IFS= read -r key || [ -n "$key" ]; do
+      add_unique_token "$key"
+    done < <(parse_key_csv "$NVIDIA_API_KEYS")
+  elif [ -n "${NVIDIA_API_KEY:-}" ]; then
+    add_unique_token "$NVIDIA_API_KEY"
+  fi
 }
 
 set_config_value() {
@@ -81,6 +159,49 @@ set_config_value() {
   mv "$tmp" "$CONFIG_FILE"
 }
 
+save_keys() {
+  local tmp line key existing duplicate
+  local keys=()
+  for key in "$@"; do
+    key="$(trim "$key")"
+    [ -n "$key" ] || continue
+    duplicate=0
+    for existing in "${keys[@]:-}"; do
+      if [ "$existing" = "$key" ]; then
+        duplicate=1
+        break
+      fi
+    done
+    [ "$duplicate" -eq 0 ] && keys+=("$key")
+  done
+  if [ "${#keys[@]}" -eq 0 ]; then
+    say "Refusing to save an empty token list."
+    return 1
+  fi
+
+  mkdir -p "$CONFIG_DIR"
+  tmp="$(mktemp "$CONFIG_DIR/config.XXXXXX")"
+  if [ -f "$CONFIG_FILE" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        NVIDIA_API_KEY=*|NVIDIA_API_KEYS=*) ;;
+        *) printf '%s\n' "$line" >> "$tmp" ;;
+      esac
+    done < "$CONFIG_FILE"
+  fi
+  for key in "${keys[@]}"; do
+    printf 'NVIDIA_API_KEY=%s\n' "$key" >> "$tmp"
+  done
+  chmod 600 "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
+
+  if [ "${#keys[@]}" -eq 1 ]; then
+    say "Token saved to $CONFIG_FILE"
+  else
+    say "${#keys[@]} tokens saved to $CONFIG_FILE"
+  fi
+}
+
 remove_config_value() {
   local name="$1" tmp line
   [ -f "$CONFIG_FILE" ] || return 0
@@ -95,15 +216,22 @@ remove_config_value() {
   mv "$tmp" "$CONFIG_FILE"
 }
 
+remove_all_keys() {
+  local tmp line
+  [ -f "$CONFIG_FILE" ] || return 0
+  tmp="$(mktemp "$CONFIG_DIR/config.XXXXXX")"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      NVIDIA_API_KEY=*|NVIDIA_API_KEYS=*) ;;
+      *) printf '%s\n' "$line" >> "$tmp" ;;
+    esac
+  done < "$CONFIG_FILE"
+  chmod 600 "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
+}
+
 save_key() {
-  local key
-  key="$(trim "$1")"
-  if [ -z "$key" ]; then
-    say "Refusing to save an empty key."
-    return 1
-  fi
-  set_config_value NVIDIA_API_KEY "$key"
-  say "Key saved to $CONFIG_FILE"
+  save_keys "$1"
 }
 
 save_model() {
@@ -141,6 +269,23 @@ read_secret() {
   printf '%s' "$value"
 }
 
+join_keys() {
+  local IFS=','
+  printf '%s' "$*"
+}
+
+mask_key() {
+  local key="$1" len head tail
+  len="${#key}"
+  if [ "$len" -le 10 ]; then
+    printf '****'
+    return
+  fi
+  head="${key:0:6}"
+  tail="${key:$((len - 4)):4}"
+  printf '%s...%s' "$head" "$tail"
+}
+
 interactive_setup() {
   say ""
   say "+------------------------------------------+"
@@ -149,7 +294,7 @@ interactive_setup() {
   say ""
   say "Claude Code will run against NVIDIA NIM."
   say "You only need to enter your NVIDIA API key once."
-  say "Get a key from NVIDIA API Catalog."
+  say "Additional tokens can be added later with: nvidiaclaude token add"
   say ""
   local key="" tries=0
   while :; do
@@ -166,6 +311,91 @@ interactive_setup() {
   say ""
 }
 
+token_usage() {
+  say "Usage:"
+  say "  nvidiaclaude token add [KEY]"
+  say "  nvidiaclaude token list"
+  say "  nvidiaclaude token remove <INDEX>"
+  say "  nvidiaclaude token clear"
+}
+
+token_command() {
+  local action="${2:-list}" key existing index
+  local next=()
+  case "$action" in
+    add)
+      if [ "${3:-}" != "" ]; then
+        key="$(trim "$3")"
+      else
+        key="$(trim "$(read_secret 'NVIDIA API key: ')")"
+      fi
+      if [ -z "$key" ]; then
+        say "Token can't be empty."
+        exit 1
+      fi
+      load_config_keys
+      for existing in "${TOKENS[@]:-}"; do
+        if [ "$existing" = "$key" ]; then
+          say "Token already exists: $(mask_key "$key")"
+          exit 0
+        fi
+      done
+      TOKENS+=("$key")
+      save_keys "${TOKENS[@]}"
+      ;;
+    list|ls)
+      load_config_keys
+      if [ "${#TOKENS[@]}" -eq 0 ]; then
+        printf '%s\n' "No stored NVIDIA API tokens."
+      else
+        local i=1
+        for key in "${TOKENS[@]}"; do
+          printf '%d. %s\n' "$i" "$(mask_key "$key")"
+          i=$((i + 1))
+        done
+      fi
+      ;;
+    remove|rm|delete)
+      index="${3:-}"
+      if ! [[ "$index" =~ ^[0-9]+$ ]] || [ "$index" -lt 1 ]; then
+        say "Token index must be a positive number."
+        token_usage
+        exit 1
+      fi
+      load_config_keys
+      if [ "$index" -gt "${#TOKENS[@]}" ]; then
+        say "No token exists at index $index."
+        exit 1
+      fi
+      local i=1
+      for key in "${TOKENS[@]}"; do
+        if [ "$i" -ne "$index" ]; then
+          next+=("$key")
+        fi
+        i=$((i + 1))
+      done
+      if [ "${#next[@]}" -eq 0 ]; then
+        remove_all_keys
+        say "All stored tokens removed."
+      else
+        save_keys "${next[@]}"
+      fi
+      ;;
+    clear|reset)
+      remove_all_keys
+      say "All stored tokens removed."
+      ;;
+    help|--help|-h)
+      token_usage
+      ;;
+    *)
+      say "Unknown token command: $action"
+      token_usage
+      exit 1
+      ;;
+  esac
+}
+
 show_commands() {
   cat <<EOF
 nvidiaclaude command reference
@@ -177,15 +407,27 @@ Start
 
 API key
   nvidiaclaude config <KEY>
-      Save or replace the NVIDIA API key without an interactive prompt.
+      Replace the stored token list with one NVIDIA API token.
 
   nvidiaclaude change-key [KEY]
-      Change the stored NVIDIA API key. If KEY is omitted, nvidiaclaude asks
+      Replace the stored token list. If KEY is omitted, nvidiaclaude asks
       for it securely.
       Aliases: config, set-key, change
 
+  nvidiaclaude token add [KEY]
+      Add another NVIDIA API token for automatic failover.
+
+  nvidiaclaude token list
+      List saved tokens with masked values.
+
+  nvidiaclaude token remove <INDEX>
+      Remove one saved token by index from token list.
+
+  nvidiaclaude token clear
+      Remove all saved tokens. The stored model is kept.
+
   nvidiaclaude reset
-      Remove the stored NVIDIA API key. The stored model is kept.
+      Remove all saved tokens. The stored model is kept.
 
 Model
   nvidiaclaude change-model <MODEL>
@@ -204,7 +446,7 @@ Model
 
 Maintenance
   nvidiaclaude update
-      Re-run the installer from the main branch.
+      Re-run the installer from the selected install branch.
       Aliases: upgrade
 
   nvidiaclaude commands
@@ -213,7 +455,11 @@ Maintenance
 
 Environment overrides
   NVIDIA_API_KEY
-      Use this API key if no key is stored yet. It will be saved for next time.
+      Use this token if no token is stored yet. It will be saved for next time.
+
+  NVIDIA_API_KEYS
+      Comma-separated token list if no token is stored yet. It will be saved
+      for next time.
 
   NVIDIA_NIM_MODEL
       Override the configured model for one run.
@@ -221,6 +467,17 @@ Environment overrides
   NVIDIA_NIM_ENDPOINT
       Override the NVIDIA NIM endpoint for one run.
       Default: $DEFAULT_ENDPOINT
+
+  NVIDIACLAUDE_STREAM_PING_SECONDS
+      Send Anthropic SSE ping events while waiting for NVIDIA NIM stream
+      chunks. Default: 2. Set to 0 to disable.
+
+  NVIDIACLAUDE_TOKEN_COOLDOWN_SECONDS
+      Seconds to avoid a token after a token-specific failure, including
+      NVIDIA 429 rate-limit responses. Default: 60.
+
+  NVIDIACLAUDE_INSTALL_REF
+      Override the install/update branch for one install or update.
 
   NVIDIACLAUDE_BIN_DIR
       Override the install directory used by install.sh.
@@ -280,7 +537,7 @@ start_proxy() {
     --host 127.0.0.1 \
     --port 0 \
     --ready-file "$ready_file" \
-    > "$log_file" 2>&1 &
+    > "$log_file" &
   PROXY_PID=$!
 
   attempts=0
@@ -321,6 +578,10 @@ case "${1:-}" in
     say "Done. Run 'nvidiaclaude' to start."
     exit 0
     ;;
+  token|tokens)
+    token_command "$@"
+    exit 0
+    ;;
   change-model|--change-model|set-model|--set-model)
     if [ "${2:-}" = "" ]; then
       say "Usage: nvidiaclaude change-model <MODEL>"
@@ -340,32 +601,37 @@ case "${1:-}" in
     exit 0
     ;;
   reset|--reset)
-    remove_config_value NVIDIA_API_KEY
-    say "Stored key removed."
+    remove_all_keys
+    say "All stored tokens removed."
     exit 0
     ;;
   update|--update|upgrade|--upgrade)
-    say "Updating nvidiaclaude to the latest version..."
-    curl -fsSL "https://raw.githubusercontent.com/fadhluibnu/nvidiaclaude/main/install.sh" | bash
+    REF="$(install_ref)"
+    say "Updating nvidiaclaude from '$REF'..."
+    curl -fsSL "https://raw.githubusercontent.com/fadhluibnu/nvidiaclaude/$REF/install.sh" \
+      | NVIDIACLAUDE_INSTALL_REF="$REF" bash
     exit $?
     ;;
 esac
 
-KEY="$(read_config_value NVIDIA_API_KEY)"
+TOKENS=()
+load_config_keys
 
-if [ -z "${KEY:-}" ] && [ -n "${NVIDIA_API_KEY:-}" ]; then
-  KEY="$(trim "$NVIDIA_API_KEY")"
-  say "Using NVIDIA_API_KEY from environment; saving for next time."
-  save_key "$KEY" || true
+if [ "${#TOKENS[@]}" -eq 0 ]; then
+  load_env_keys
+  if [ "${#TOKENS[@]}" -gt 0 ]; then
+    say "Using NVIDIA API token(s) from environment; saving for next time."
+    save_keys "${TOKENS[@]}" || true
+  fi
 fi
 
-if [ -z "${KEY:-}" ]; then
+if [ "${#TOKENS[@]}" -eq 0 ]; then
   interactive_setup
-  KEY="$(read_config_value NVIDIA_API_KEY)"
+  load_config_keys
 fi
 
-if [ -z "${KEY:-}" ]; then
-  say "No API key available. Run 'nvidiaclaude config' to set one."
+if [ "${#TOKENS[@]}" -eq 0 ]; then
+  say "No API token available. Run 'nvidiaclaude token add' to set one."
   exit 1
 fi
 
@@ -375,7 +641,8 @@ if ! command -v claude >/dev/null 2>&1; then
   exit 127
 fi
 
-export NVIDIA_API_KEY="$KEY"
+export NVIDIA_API_KEY="${TOKENS[0]}"
+export NVIDIA_API_KEYS="$(join_keys "${TOKENS[@]}")"
 export NVIDIA_NIM_ENDPOINT="${NVIDIA_NIM_ENDPOINT:-$DEFAULT_ENDPOINT}"
 export NVIDIA_NIM_MODEL="$(configured_model)"
 
