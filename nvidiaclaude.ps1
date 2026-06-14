@@ -396,6 +396,74 @@ function Stop-NvidiaClaudeProxy($Proxy) {
   } catch { }
 }
 
+function Stop-InstalledNvidiaClaudeProxyProcesses([string]$ProxyFile) {
+  if (-not $ProxyFile) { return }
+  try {
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+      Where-Object {
+        $_.ProcessId -ne $PID -and
+        $_.CommandLine -and
+        $_.CommandLine.IndexOf($ProxyFile, [StringComparison]::OrdinalIgnoreCase) -ge 0
+      } |
+      ForEach-Object {
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+      }
+  } catch { }
+}
+
+function Remove-PathEntry([string]$PathToRemove) {
+  if (-not $PathToRemove) { return }
+  $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+  if (-not $userPath) { return }
+  $parts = @()
+  foreach ($part in ($userPath -split ';')) {
+    if ($part -and ($part.TrimEnd('\') -ine $PathToRemove.TrimEnd('\'))) {
+      $parts += $part
+    }
+  }
+  [Environment]::SetEnvironmentVariable('Path', ($parts -join ';'), 'User')
+}
+
+function Remove-NvidiaClaudeTempDirs {
+  try {
+    $tempRoot = [IO.Path]::GetTempPath()
+    Get-ChildItem -Path $tempRoot -Directory -Filter 'nvidiaclaude-*' -ErrorAction SilentlyContinue |
+      Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+  } catch { }
+}
+
+function Invoke-Uninstall {
+  $scriptDir = Split-Path -Parent $PSCommandPath
+  $marker = Join-Path $scriptDir '.nvidiaclaude-install-ref'
+  $proxyFile = Join-Path $scriptDir 'nvidiaclaude_proxy.py'
+
+  Stop-InstalledNvidiaClaudeProxyProcesses $proxyFile
+
+  if (Test-Path $ConfigDir) {
+    Remove-Item -Recurse -Force $ConfigDir -ErrorAction SilentlyContinue
+    Write-Host "Removed config: $ConfigDir"
+  }
+
+  Remove-NvidiaClaudeTempDirs
+
+  if (Test-Path $marker) {
+    foreach ($name in @('nvidiaclaude.ps1', 'nvidiaclaude.cmd', 'nvidiaclaude_proxy.py', '.nvidiaclaude-install-ref')) {
+      Remove-Item -Force (Join-Path $scriptDir $name) -ErrorAction SilentlyContinue
+    }
+    Remove-PathEntry $scriptDir
+    try {
+      if ((Get-ChildItem -Force $scriptDir -ErrorAction SilentlyContinue | Measure-Object).Count -eq 0) {
+        Remove-Item -Force $scriptDir -ErrorAction SilentlyContinue
+      }
+    } catch { }
+    Write-Host "Removed install files from: $scriptDir"
+  } else {
+    Write-Host "No install marker found in $scriptDir; leaving script files in place."
+  }
+
+  Write-Host 'Uninstall complete. Open a new terminal before reinstalling or checking PATH.'
+}
+
 function Show-Commands {
   @"
 nvidiaclaude command reference
@@ -448,6 +516,10 @@ Maintenance
   nvidiaclaude update
       Re-run the installer from the selected install branch.
       Aliases: upgrade
+
+  nvidiaclaude uninstall
+      Stop leftover nvidiaclaude proxy processes and remove installed files,
+      stored config, temporary nvidiaclaude directories, and the user PATH entry.
 
   nvidiaclaude commands
       Show this command reference.
@@ -543,6 +615,10 @@ if ($args.Count -ge 1) {
       Write-Host "Updating nvidiaclaude from '$ref'..."
       $env:NVIDIACLAUDE_INSTALL_REF = $ref
       irm "https://raw.githubusercontent.com/fadhluibnu/nvidiaclaude/$ref/install.ps1" | iex
+      exit 0
+    }
+    '^(uninstall|--uninstall)$' {
+      Invoke-Uninstall
       exit 0
     }
   }
