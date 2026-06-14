@@ -130,9 +130,6 @@ NVIDIA_NIM_MODEL=<MODEL> nvidiaclaude
 NVIDIA_NIM_ENDPOINT=<URL> nvidiaclaude
 NVIDIACLAUDE_STREAM_PING_SECONDS=<SECONDS> nvidiaclaude
 NVIDIACLAUDE_TOKEN_COOLDOWN_SECONDS=<SECONDS> nvidiaclaude
-NVIDIACLAUDE_RATE_LIMIT_RPM=<RPM> nvidiaclaude
-NVIDIACLAUDE_RATE_LIMIT_SCOPE=global nvidiaclaude
-NVIDIACLAUDE_RATE_LIMIT_WINDOW_SECONDS=<SECONDS> nvidiaclaude
 NVIDIACLAUDE_INSTALL_REF=dev nvidiaclaude update
 NVIDIACLAUDE_BIN_DIR=<DIR> ./install.sh
 ```
@@ -143,13 +140,7 @@ stored yet.
 `NVIDIACLAUDE_STREAM_PING_SECONDS` controls stream heartbeat pings while
 waiting for NVIDIA NIM chunks. Set it to `0` to disable pings.
 `NVIDIACLAUDE_TOKEN_COOLDOWN_SECONDS` controls how long a failed token is
-avoided after token auth or quota errors. Default: `60`.
-`NVIDIACLAUDE_RATE_LIMIT_RPM` proactively throttles NVIDIA requests. Default:
-`38`. Set it to `0` to disable proactive throttling.
-`NVIDIACLAUDE_RATE_LIMIT_SCOPE` controls whether RPM is shared globally or per
-token. Default: `global`.
-`NVIDIACLAUDE_RATE_LIMIT_WINDOW_SECONDS` changes the rate-limit window.
-Default: `60`.
+avoided after token auth, quota, or rate-limit errors. Default: `60`.
 `NVIDIACLAUDE_INSTALL_REF` overrides the install/update branch for one run.
 `NVIDIACLAUDE_BIN_DIR` changes where the shell installer writes files.
 
@@ -184,7 +175,7 @@ nvidiaclaude reset             # alias for clearing stored tokens
 They replace the stored token list with a single token for compatibility with
 older installs.
 
-## Auto Failover and Throttling
+## Auto Failover
 
 When multiple tokens are configured, the local proxy automatically switches to
 the next token for token-specific failures:
@@ -192,20 +183,17 @@ the next token for token-specific failures:
 - invalid or expired token responses
 - unauthorized or forbidden token responses
 - token auth or token quota messages
+- HTTP `429`, RPM, or rate-limit messages
 
-HTTP `429` and RPM rate-limit messages are handled as shared backoff instead:
-the proxy waits and retries internally before returning an error to Claude Code.
-For streaming responses, retry is safe before content output starts. If a token
-fails after partial streaming output, the proxy returns an SSE error for that
-response, marks the limiter state when possible, and waits before the next
-request.
+When a token returns `429`, the proxy marks that token as cooling down and
+immediately tries the next ready token. The proxy does not proactively queue or
+slow requests to stay below NVIDIA RPM limits. If every configured token is
+rate limited, the request fails with a clear error so Claude Code can stop
+instead of waiting for a long internal retry loop.
 
-The proxy also slows requests before they reach NVIDIA's RPM cap. By default,
-all tokens share `38` requests per `60` seconds because NVIDIA may enforce RPM
-per account or project. If the shared pool is full, the request waits for the
-next available slot. Streaming sessions keep receiving SSE `ping` events while
-waiting. Use `NVIDIACLAUDE_RATE_LIMIT_SCOPE=per-token` only when tokens are
-known to have separate NVIDIA rate-limit pools.
+For streaming responses, failover is safe before content output starts. If a
+token fails after partial streaming output, the proxy returns an SSE error for
+that response and avoids that token for the cooldown window.
 
 ## Manage Your Model
 

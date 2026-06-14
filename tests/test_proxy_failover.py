@@ -28,10 +28,8 @@ class DummyResponse:
         return self.body
 
 
-def make_config(keys=("token-a", "token-b"), rate_limit_scope="global"):
+def make_config(keys=("token-a", "token-b")):
     cooldown = 60.0
-    rate_limit_rpm = 38.0
-    rate_limit_window_seconds = 60.0
     return proxy.ProxyConfig(
         endpoint="https://example.test/v1/chat/completions",
         api_keys=list(keys),
@@ -39,31 +37,11 @@ def make_config(keys=("token-a", "token-b"), rate_limit_scope="global"):
         timeout=1.0,
         stream_ping_seconds=0.1,
         token_cooldown_seconds=cooldown,
-        rate_limit_rpm=rate_limit_rpm,
-        rate_limit_scope=rate_limit_scope,
-        rate_limit_window_seconds=rate_limit_window_seconds,
         token_manager=proxy.TokenManager(
             len(keys),
             cooldown,
-            rate_limit_rpm,
-            rate_limit_scope,
-            rate_limit_window_seconds,
         ),
     )
-
-
-class FakeClock:
-    def __init__(self):
-        self.now = 0.0
-        self.waits: list[float] = []
-
-    def time(self):
-        return self.now
-
-    def wait(self, seconds):
-        self.waits.append(seconds)
-        self.now += seconds
-        return True
 
 
 class FailoverTests(unittest.TestCase):
@@ -118,26 +96,51 @@ class FailoverTests(unittest.TestCase):
         self.assertIn("All configured NVIDIA API tokens failed", raised.exception.message)
         self.assertEqual(calls, [0, 1])
 
-    def test_provider_request_with_failover_waits_and_retries_after_429(self):
-        clock = FakeClock()
+    def test_provider_request_with_failover_switches_token_after_429(self):
         config = make_config()
         calls = []
 
         def fake_provider_request(_config, _payload, token_index):
             calls.append(token_index)
-            if len(calls) == 1:
+            if token_index == 0:
                 raise proxy.ProviderError(429, "rate limit", {"Retry-After": "2"})
             return DummyResponse()
 
-        with patch.object(proxy.time, "time", side_effect=clock.time):
-            with patch.object(config.token_manager.condition, "wait", side_effect=clock.wait):
-                with patch.object(proxy, "provider_request", side_effect=fake_provider_request):
-                    response, token_index = proxy.provider_request_with_failover(config, {"stream": False})
+        with patch.object(proxy, "provider_request", side_effect=fake_provider_request):
+            response, token_index = proxy.provider_request_with_failover(config, {"stream": False})
 
         self.assertIsInstance(response, DummyResponse)
-        self.assertEqual(token_index, 0)
-        self.assertEqual(calls, [0, 0])
-        self.assertEqual(clock.waits, [2.0])
+        self.assertEqual(token_index, 1)
+        self.assertEqual(calls, [0, 1])
+
+    def test_provider_request_with_failover_reports_all_tokens_rate_limited(self):
+        config = make_config()
+        calls = []
+
+        def fake_provider_request(_config, _payload, token_index):
+            calls.append(token_index)
+            raise proxy.ProviderError(429, "rate limit")
+
+        with patch.object(proxy, "provider_request", side_effect=fake_provider_request):
+            with self.assertRaises(proxy.ProviderError) as raised:
+                proxy.provider_request_with_failover(config, {"stream": False})
+
+        self.assertEqual(raised.exception.status, 429)
+        self.assertIn("currently rate limited", raised.exception.message)
+        self.assertEqual(calls, [0, 1])
+
+    def test_provider_request_with_failover_fails_fast_when_all_tokens_cooling(self):
+        config = make_config()
+        config.token_manager.mark_token_limited(0)
+        config.token_manager.mark_token_limited(1)
+
+        with patch.object(proxy, "provider_request") as provider_request:
+            with self.assertRaises(proxy.ProviderError) as raised:
+                proxy.provider_request_with_failover(config, {"stream": False})
+
+        provider_request.assert_not_called()
+        self.assertEqual(raised.exception.status, 429)
+        self.assertIn("currently cooling down", raised.exception.message)
 
     def test_stream_provider_uses_failover_before_emitting_error(self):
         config = make_config()
@@ -162,78 +165,26 @@ class FailoverTests(unittest.TestCase):
         self.assertEqual(collected[-1][0], "done")
         self.assertNotIn("provider_error", [event_type for event_type, _ in collected])
 
-    def test_token_manager_waits_until_oldest_request_exits_window(self):
-        clock = FakeClock()
-        manager = proxy.TokenManager(
-            token_count=1,
-            cooldown_seconds=60.0,
-            rate_limit_rpm=2,
-            rate_limit_scope="global",
-            rate_limit_window_seconds=10.0,
-        )
-
-        with patch.object(proxy.time, "time", side_effect=clock.time):
-            with patch.object(manager.condition, "wait", side_effect=clock.wait):
-                self.assertEqual(manager.acquire_token(), 0)
-                self.assertEqual(manager.acquire_token(), 0)
-                self.assertEqual(manager.acquire_token(), 0)
-
-        self.assertEqual(clock.waits, [10.0])
-        self.assertEqual(clock.now, 10.0)
-
-    def test_token_manager_global_scope_waits_across_tokens(self):
-        clock = FakeClock()
+    def test_token_manager_skips_cooling_tokens_without_waiting(self):
         manager = proxy.TokenManager(
             token_count=2,
             cooldown_seconds=60.0,
-            rate_limit_rpm=1,
-            rate_limit_scope="global",
-            rate_limit_window_seconds=10.0,
         )
 
-        with patch.object(proxy.time, "time", side_effect=clock.time):
-            with patch.object(manager.condition, "wait", side_effect=clock.wait):
-                self.assertEqual(manager.acquire_token(), 0)
-                self.assertEqual(manager.acquire_token(), 0)
+        manager.mark_token_limited(0)
 
-        self.assertEqual(clock.waits, [10.0])
-        self.assertEqual(clock.now, 10.0)
+        self.assertEqual(manager.acquire_token(), 1)
 
-    def test_token_manager_per_token_scope_uses_next_token_when_active_token_is_full(self):
-        clock = FakeClock()
+    def test_token_manager_returns_none_when_every_available_token_is_cooling(self):
         manager = proxy.TokenManager(
             token_count=2,
             cooldown_seconds=60.0,
-            rate_limit_rpm=1,
-            rate_limit_scope="per-token",
-            rate_limit_window_seconds=10.0,
         )
 
-        with patch.object(proxy.time, "time", side_effect=clock.time):
-            with patch.object(manager.condition, "wait", side_effect=clock.wait):
-                self.assertEqual(manager.acquire_token(), 0)
-                self.assertEqual(manager.acquire_token(), 1)
+        manager.mark_token_limited(0)
+        manager.mark_token_limited(1)
 
-        self.assertEqual(clock.waits, [])
-        self.assertEqual(clock.now, 0.0)
-
-    def test_token_manager_rate_limit_can_be_disabled(self):
-        clock = FakeClock()
-        manager = proxy.TokenManager(
-            token_count=1,
-            cooldown_seconds=60.0,
-            rate_limit_rpm=0,
-            rate_limit_scope="global",
-            rate_limit_window_seconds=10.0,
-        )
-
-        with patch.object(proxy.time, "time", side_effect=clock.time):
-            with patch.object(manager.condition, "wait", side_effect=clock.wait):
-                self.assertEqual(manager.acquire_token(), 0)
-                self.assertEqual(manager.acquire_token(), 0)
-                self.assertEqual(manager.acquire_token(), 0)
-
-        self.assertEqual(clock.waits, [])
+        self.assertIsNone(manager.acquire_token())
 
 
 if __name__ == "__main__":
