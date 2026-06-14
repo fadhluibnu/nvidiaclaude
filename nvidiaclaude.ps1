@@ -476,8 +476,11 @@ Environment overrides
       Seconds to avoid a token after a token-specific failure. Default: 60.
 
   NVIDIACLAUDE_RATE_LIMIT_RPM
-      Maximum NVIDIA requests per token per rate-limit window. Default: 38.
+      Maximum NVIDIA requests per shared rate-limit window. Default: 38.
       Set to 0 to disable proactive throttling.
+
+  NVIDIACLAUDE_RATE_LIMIT_SCOPE
+      Rate-limit scope: global or per-token. Default: global.
 
   NVIDIACLAUDE_RATE_LIMIT_WINDOW_SECONDS
       Rate-limit window length in seconds. Default: 60.

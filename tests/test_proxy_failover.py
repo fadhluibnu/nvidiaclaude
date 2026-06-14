@@ -28,7 +28,7 @@ class DummyResponse:
         return self.body
 
 
-def make_config(keys=("token-a", "token-b")):
+def make_config(keys=("token-a", "token-b"), rate_limit_scope="global"):
     cooldown = 60.0
     rate_limit_rpm = 38.0
     rate_limit_window_seconds = 60.0
@@ -40,11 +40,13 @@ def make_config(keys=("token-a", "token-b")):
         stream_ping_seconds=0.1,
         token_cooldown_seconds=cooldown,
         rate_limit_rpm=rate_limit_rpm,
+        rate_limit_scope=rate_limit_scope,
         rate_limit_window_seconds=rate_limit_window_seconds,
         token_manager=proxy.TokenManager(
             len(keys),
             cooldown,
             rate_limit_rpm,
+            rate_limit_scope,
             rate_limit_window_seconds,
         ),
     )
@@ -68,14 +70,14 @@ class FailoverTests(unittest.TestCase):
     def test_split_api_keys_trims_and_deduplicates(self):
         self.assertEqual(proxy.split_api_keys(" a, b ,,a , c "), ["a", "b", "c"])
 
-    def test_provider_request_with_failover_retries_next_token(self):
+    def test_provider_request_with_failover_retries_next_token_for_auth_failure(self):
         config = make_config()
         calls = []
 
         def fake_provider_request(_config, _payload, token_index):
             calls.append(token_index)
             if token_index == 0:
-                raise proxy.ProviderError(429, "rate limit")
+                raise proxy.ProviderError(401, "invalid api key")
             return DummyResponse()
 
         with patch.object(proxy, "provider_request", side_effect=fake_provider_request):
@@ -100,21 +102,42 @@ class FailoverTests(unittest.TestCase):
         self.assertEqual(raised.exception.status, 400)
         self.assertEqual(calls, [0])
 
-    def test_provider_request_with_failover_reports_all_limited(self):
+    def test_provider_request_with_failover_reports_all_token_failures(self):
         config = make_config()
         calls = []
 
         def fake_provider_request(_config, _payload, token_index):
             calls.append(token_index)
-            raise proxy.ProviderError(429, "rate limit")
+            raise proxy.ProviderError(401, "invalid api key")
 
         with patch.object(proxy, "provider_request", side_effect=fake_provider_request):
             with self.assertRaises(proxy.ProviderError) as raised:
                 proxy.provider_request_with_failover(config, {"stream": False})
 
-        self.assertEqual(raised.exception.status, 429)
+        self.assertEqual(raised.exception.status, 401)
         self.assertIn("All configured NVIDIA API tokens failed", raised.exception.message)
         self.assertEqual(calls, [0, 1])
+
+    def test_provider_request_with_failover_waits_and_retries_after_429(self):
+        clock = FakeClock()
+        config = make_config()
+        calls = []
+
+        def fake_provider_request(_config, _payload, token_index):
+            calls.append(token_index)
+            if len(calls) == 1:
+                raise proxy.ProviderError(429, "rate limit", {"Retry-After": "2"})
+            return DummyResponse()
+
+        with patch.object(proxy.time, "time", side_effect=clock.time):
+            with patch.object(config.token_manager.condition, "wait", side_effect=clock.wait):
+                with patch.object(proxy, "provider_request", side_effect=fake_provider_request):
+                    response, token_index = proxy.provider_request_with_failover(config, {"stream": False})
+
+        self.assertIsInstance(response, DummyResponse)
+        self.assertEqual(token_index, 0)
+        self.assertEqual(calls, [0, 0])
+        self.assertEqual(clock.waits, [2.0])
 
     def test_stream_provider_uses_failover_before_emitting_error(self):
         config = make_config()
@@ -123,7 +146,7 @@ class FailoverTests(unittest.TestCase):
         def fake_provider_request(_config, _payload, token_index):
             calls.append(token_index)
             if token_index == 0:
-                raise proxy.ProviderError(429, "rate limit")
+                raise proxy.ProviderError(401, "invalid api key")
             return DummyResponse(lines=[b"data: [DONE]\n"])
 
         events: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -145,6 +168,7 @@ class FailoverTests(unittest.TestCase):
             token_count=1,
             cooldown_seconds=60.0,
             rate_limit_rpm=2,
+            rate_limit_scope="global",
             rate_limit_window_seconds=10.0,
         )
 
@@ -157,12 +181,31 @@ class FailoverTests(unittest.TestCase):
         self.assertEqual(clock.waits, [10.0])
         self.assertEqual(clock.now, 10.0)
 
-    def test_token_manager_uses_next_token_when_active_token_is_full(self):
+    def test_token_manager_global_scope_waits_across_tokens(self):
         clock = FakeClock()
         manager = proxy.TokenManager(
             token_count=2,
             cooldown_seconds=60.0,
             rate_limit_rpm=1,
+            rate_limit_scope="global",
+            rate_limit_window_seconds=10.0,
+        )
+
+        with patch.object(proxy.time, "time", side_effect=clock.time):
+            with patch.object(manager.condition, "wait", side_effect=clock.wait):
+                self.assertEqual(manager.acquire_token(), 0)
+                self.assertEqual(manager.acquire_token(), 0)
+
+        self.assertEqual(clock.waits, [10.0])
+        self.assertEqual(clock.now, 10.0)
+
+    def test_token_manager_per_token_scope_uses_next_token_when_active_token_is_full(self):
+        clock = FakeClock()
+        manager = proxy.TokenManager(
+            token_count=2,
+            cooldown_seconds=60.0,
+            rate_limit_rpm=1,
+            rate_limit_scope="per-token",
             rate_limit_window_seconds=10.0,
         )
 
@@ -180,6 +223,7 @@ class FailoverTests(unittest.TestCase):
             token_count=1,
             cooldown_seconds=60.0,
             rate_limit_rpm=0,
+            rate_limit_scope="global",
             rate_limit_window_seconds=10.0,
         )
 
