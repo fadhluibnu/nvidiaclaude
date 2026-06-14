@@ -114,12 +114,14 @@ model new runs will use. Use `reset-model` to return to the default model.
 
 ```bash
 nvidiaclaude update
+nvidiaclaude uninstall
 nvidiaclaude commands
 ```
 
-`update` re-runs the installer from the selected install branch. `commands`
-prints the nvidiaclaude command reference. Aliases for `commands`: `help`,
-`--help-nvidiaclaude`.
+`update` re-runs the installer from the selected install branch. `uninstall`
+removes installed files, stored config, temporary files, and leftover local
+proxy processes. `commands` prints the nvidiaclaude command reference. Aliases
+for `commands`: `help`, `--help-nvidiaclaude`.
 
 ### Environment Overrides
 
@@ -130,6 +132,9 @@ NVIDIA_NIM_MODEL=<MODEL> nvidiaclaude
 NVIDIA_NIM_ENDPOINT=<URL> nvidiaclaude
 NVIDIACLAUDE_STREAM_PING_SECONDS=<SECONDS> nvidiaclaude
 NVIDIACLAUDE_TOKEN_COOLDOWN_SECONDS=<SECONDS> nvidiaclaude
+NVIDIACLAUDE_RATE_LIMIT_RPM=<RPM> nvidiaclaude
+NVIDIACLAUDE_RATE_LIMIT_SCOPE=global nvidiaclaude
+NVIDIACLAUDE_RATE_LIMIT_WINDOW_SECONDS=<SECONDS> nvidiaclaude
 NVIDIACLAUDE_INSTALL_REF=dev nvidiaclaude update
 NVIDIACLAUDE_BIN_DIR=<DIR> ./install.sh
 ```
@@ -141,6 +146,12 @@ stored yet.
 waiting for NVIDIA NIM chunks. Set it to `0` to disable pings.
 `NVIDIACLAUDE_TOKEN_COOLDOWN_SECONDS` controls how long a failed token is
 avoided after token auth, quota, or rate-limit errors. Default: `60`.
+`NVIDIACLAUDE_RATE_LIMIT_RPM` proactively throttles NVIDIA requests. Default:
+`38`; set it to `0` to disable proactive throttling.
+`NVIDIACLAUDE_RATE_LIMIT_SCOPE` can be `global` or `per-token`. Default:
+`global`.
+`NVIDIACLAUDE_RATE_LIMIT_WINDOW_SECONDS` controls the RPM window length.
+Default: `60`.
 `NVIDIACLAUDE_INSTALL_REF` overrides the install/update branch for one run.
 `NVIDIACLAUDE_BIN_DIR` changes where the shell installer writes files.
 
@@ -186,10 +197,15 @@ the next token for token-specific failures:
 - HTTP `429`, RPM, or rate-limit messages
 
 When a token returns `429`, the proxy marks that token as cooling down and
-immediately tries the next ready token. The proxy does not proactively queue or
-slow requests to stay below NVIDIA RPM limits. If every configured token is
-rate limited, the request fails with a clear error so Claude Code can stop
-instead of waiting for a long internal retry loop.
+immediately tries the next ready token. If every configured token is cooling
+down after provider rate-limit responses, the request fails with a clear error
+so Claude Code can stop instead of waiting for a long internal retry loop.
+
+The proxy also has a silent proactive RPM throttle to avoid hitting NVIDIA's
+shared request-per-minute limits. When the shared RPM bucket is full, the proxy
+waits internally and does not print `NVIDIA shared RPM limit reached` messages
+to your terminal. Use `NVIDIACLAUDE_RATE_LIMIT_SCOPE=per-token` only when your
+tokens are known to have separate RPM buckets.
 
 For streaming responses, failover is safe before content output starts. If a
 token fails after partial streaming output, the proxy returns an SSE error for
@@ -316,20 +332,61 @@ claude --dangerously-skip-permissions "$@"
 
 ## Uninstall
 
-macOS / Linux:
+Preferred:
 
 ```bash
-rm ~/.local/bin/nvidiaclaude
-rm ~/.local/bin/nvidiaclaude_proxy.py
-rm ~/.local/bin/.nvidiaclaude-install-ref
-rm -rf ~/.config/nvidiaclaude
+nvidiaclaude uninstall
 ```
 
 Windows PowerShell:
 
 ```powershell
-Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Programs\nvidiaclaude"
-Remove-Item -Recurse -Force "$env:APPDATA\nvidiaclaude"
+nvidiaclaude uninstall
+```
+
+The uninstall command stops leftover `nvidiaclaude_proxy.py` processes for the
+installed copy, removes installed command files, removes stored config and
+tokens, removes temporary `nvidiaclaude` directories, and removes the Windows
+user PATH entry added by the PowerShell installer. This project does not
+install a systemd, launchd, or Windows service.
+
+Manual fallback for macOS / Linux:
+
+```bash
+pkill -f nvidiaclaude_proxy.py 2>/dev/null || true
+rm -f ~/.local/bin/nvidiaclaude
+rm -f ~/.local/bin/nvidiaclaude_proxy.py
+rm -f ~/.local/bin/.nvidiaclaude-install-ref
+rm -rf ~/.config/nvidiaclaude
+find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'nvidiaclaude.*' -user "$(id -u)" -exec rm -rf {} + 2>/dev/null || true
+```
+
+Manual fallback for Windows PowerShell:
+
+```powershell
+Get-CimInstance Win32_Process |
+  Where-Object { $_.CommandLine -like '*nvidiaclaude_proxy.py*' } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Programs\nvidiaclaude" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "$env:APPDATA\nvidiaclaude" -ErrorAction SilentlyContinue
+Get-ChildItem ([IO.Path]::GetTempPath()) -Directory -Filter 'nvidiaclaude-*' -ErrorAction SilentlyContinue |
+  Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+```
+
+Check for leftover proxy processes:
+
+macOS / Linux:
+
+```bash
+pgrep -af nvidiaclaude_proxy.py
+```
+
+Windows PowerShell:
+
+```powershell
+Get-CimInstance Win32_Process |
+  Where-Object { $_.CommandLine -like '*nvidiaclaude_proxy.py*' } |
+  Select-Object ProcessId, CommandLine
 ```
 
 This project does not install, update, or remove `mimoclaude`; the two commands

@@ -1,5 +1,8 @@
+import contextlib
+import io
 import queue
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -28,7 +31,12 @@ class DummyResponse:
         return self.body
 
 
-def make_config(keys=("token-a", "token-b")):
+def make_config(
+    keys=("token-a", "token-b"),
+    rate_limit_rpm=38.0,
+    rate_limit_scope="global",
+    rate_limit_window_seconds=60.0,
+):
     cooldown = 60.0
     return proxy.ProxyConfig(
         endpoint="https://example.test/v1/chat/completions",
@@ -37,9 +45,15 @@ def make_config(keys=("token-a", "token-b")):
         timeout=1.0,
         stream_ping_seconds=0.1,
         token_cooldown_seconds=cooldown,
+        rate_limit_rpm=rate_limit_rpm,
+        rate_limit_scope=rate_limit_scope,
+        rate_limit_window_seconds=rate_limit_window_seconds,
         token_manager=proxy.TokenManager(
             len(keys),
             cooldown,
+            rate_limit_rpm,
+            rate_limit_scope,
+            rate_limit_window_seconds,
         ),
     )
 
@@ -106,12 +120,17 @@ class FailoverTests(unittest.TestCase):
                 raise proxy.ProviderError(429, "rate limit", {"Retry-After": "2"})
             return DummyResponse()
 
-        with patch.object(proxy, "provider_request", side_effect=fake_provider_request):
+        stderr = io.StringIO()
+        with (
+            contextlib.redirect_stderr(stderr),
+            patch.object(proxy, "provider_request", side_effect=fake_provider_request),
+        ):
             response, token_index = proxy.provider_request_with_failover(config, {"stream": False})
 
         self.assertIsInstance(response, DummyResponse)
         self.assertEqual(token_index, 1)
         self.assertEqual(calls, [0, 1])
+        self.assertEqual(stderr.getvalue(), "")
 
     def test_provider_request_with_failover_reports_all_tokens_rate_limited(self):
         config = make_config()
@@ -174,6 +193,49 @@ class FailoverTests(unittest.TestCase):
         manager.mark_token_limited(0)
 
         self.assertEqual(manager.acquire_token(), 1)
+
+    def test_token_manager_waits_silently_for_shared_rate_limit(self):
+        manager = proxy.TokenManager(
+            token_count=2,
+            cooldown_seconds=60.0,
+            rate_limit_rpm=1.0,
+            rate_limit_scope="global",
+            rate_limit_window_seconds=0.01,
+        )
+
+        self.assertEqual(manager.acquire_token(), 0)
+        self.assertGreater(manager.rate_wait_seconds(1, time.time()), 0)
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(manager.acquire_token(), 0)
+
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_token_manager_per_token_rate_limit_can_use_other_token(self):
+        manager = proxy.TokenManager(
+            token_count=2,
+            cooldown_seconds=60.0,
+            rate_limit_rpm=1.0,
+            rate_limit_scope="per-token",
+            rate_limit_window_seconds=60.0,
+        )
+
+        self.assertEqual(manager.acquire_token(), 0)
+        self.assertEqual(manager.acquire_token(), 1)
+
+    def test_token_manager_rate_limit_can_be_disabled(self):
+        manager = proxy.TokenManager(
+            token_count=1,
+            cooldown_seconds=60.0,
+            rate_limit_rpm=0.0,
+            rate_limit_scope="global",
+            rate_limit_window_seconds=60.0,
+        )
+
+        self.assertEqual(manager.acquire_token(), 0)
+        self.assertEqual(manager.rate_wait_seconds(0, time.time()), 0.0)
+        self.assertEqual(manager.acquire_token(), 0)
 
     def test_token_manager_returns_none_when_every_available_token_is_cooling(self):
         manager = proxy.TokenManager(

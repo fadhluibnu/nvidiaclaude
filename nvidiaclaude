@@ -449,6 +449,10 @@ Maintenance
       Re-run the installer from the selected install branch.
       Aliases: upgrade
 
+  nvidiaclaude uninstall
+      Stop leftover nvidiaclaude proxy processes and remove installed files,
+      stored config, and temporary nvidiaclaude directories.
+
   nvidiaclaude commands
       Show this command reference.
       Aliases: help, --help-nvidiaclaude
@@ -475,6 +479,16 @@ Environment overrides
   NVIDIACLAUDE_TOKEN_COOLDOWN_SECONDS
       Seconds to avoid a token after a token-specific failure, including
       NVIDIA 429 rate-limit responses. Default: 60.
+
+  NVIDIACLAUDE_RATE_LIMIT_RPM
+      Maximum NVIDIA requests per shared rate-limit window. Default: 38.
+      Set to 0 to disable proactive throttling.
+
+  NVIDIACLAUDE_RATE_LIMIT_SCOPE
+      Rate-limit scope: global or per-token. Default: global.
+
+  NVIDIACLAUDE_RATE_LIMIT_WINDOW_SECONDS
+      Rate-limit window length in seconds. Default: 60.
 
   NVIDIACLAUDE_INSTALL_REF
       Override the install/update branch for one install or update.
@@ -513,6 +527,52 @@ cleanup_proxy() {
   fi
 }
 
+stop_installed_proxy_processes() {
+  local proxy_file="$1" pid
+  [ -n "$proxy_file" ] || return 0
+  command -v pgrep >/dev/null 2>&1 || return 0
+  while IFS= read -r pid || [ -n "$pid" ]; do
+    [ -n "$pid" ] || continue
+    [ "$pid" = "$$" ] && continue
+    kill "$pid" >/dev/null 2>&1 || true
+  done < <(pgrep -f "$proxy_file" 2>/dev/null || true)
+}
+
+remove_temp_dirs() {
+  local temp_root
+  temp_root="${TMPDIR:-/tmp}"
+  [ -d "$temp_root" ] || return 0
+  find "$temp_root" -maxdepth 1 -type d -name 'nvidiaclaude.*' -user "$(id -u)" \
+    -exec rm -rf {} + >/dev/null 2>&1 || true
+}
+
+uninstall_nvidiaclaude() {
+  local install_dir marker cmd_file proxy_file ref_file
+  install_dir="$(script_dir)"
+  marker="$install_dir/.nvidiaclaude-install-ref"
+  cmd_file="$install_dir/nvidiaclaude"
+  proxy_file="$install_dir/nvidiaclaude_proxy.py"
+  ref_file="$marker"
+
+  stop_installed_proxy_processes "$proxy_file"
+
+  if [ -d "$CONFIG_DIR" ]; then
+    rm -rf "$CONFIG_DIR"
+    say "Removed config: $CONFIG_DIR"
+  fi
+
+  remove_temp_dirs
+
+  if [ -f "$marker" ]; then
+    rm -f "$cmd_file" "$proxy_file" "$ref_file"
+    say "Removed install files from: $install_dir"
+  else
+    say "No install marker found in $install_dir; leaving script files in place."
+  fi
+
+  say "Uninstall complete. Open a new terminal before reinstalling or checking PATH."
+}
+
 start_proxy() {
   local python proxy_dir proxy_file ready_file log_file attempts port
   python="$(find_python)" || {
@@ -537,7 +597,7 @@ start_proxy() {
     --host 127.0.0.1 \
     --port 0 \
     --ready-file "$ready_file" \
-    > "$log_file" &
+    > "$log_file" 2>&1 &
   PROXY_PID=$!
 
   attempts=0
@@ -611,6 +671,10 @@ case "${1:-}" in
     curl -fsSL "https://raw.githubusercontent.com/fadhluibnu/nvidiaclaude/$REF/install.sh" \
       | NVIDIACLAUDE_INSTALL_REF="$REF" bash
     exit $?
+    ;;
+  uninstall|--uninstall)
+    uninstall_nvidiaclaude
+    exit 0
     ;;
 esac
 
