@@ -130,6 +130,8 @@ NVIDIA_NIM_MODEL=<MODEL> nvidiaclaude
 NVIDIA_NIM_ENDPOINT=<URL> nvidiaclaude
 NVIDIACLAUDE_STREAM_PING_SECONDS=<SECONDS> nvidiaclaude
 NVIDIACLAUDE_TOKEN_COOLDOWN_SECONDS=<SECONDS> nvidiaclaude
+NVIDIACLAUDE_RATE_LIMIT_RPM=<RPM> nvidiaclaude
+NVIDIACLAUDE_RATE_LIMIT_WINDOW_SECONDS=<SECONDS> nvidiaclaude
 NVIDIACLAUDE_INSTALL_REF=dev nvidiaclaude update
 NVIDIACLAUDE_BIN_DIR=<DIR> ./install.sh
 ```
@@ -141,6 +143,10 @@ stored yet.
 waiting for NVIDIA NIM chunks. Set it to `0` to disable pings.
 `NVIDIACLAUDE_TOKEN_COOLDOWN_SECONDS` controls how long a failed token is
 avoided after rate-limit or token auth errors. Default: `60`.
+`NVIDIACLAUDE_RATE_LIMIT_RPM` proactively throttles NVIDIA requests per token.
+Default: `38`. Set it to `0` to disable proactive throttling.
+`NVIDIACLAUDE_RATE_LIMIT_WINDOW_SECONDS` changes the rate-limit window.
+Default: `60`.
 `NVIDIACLAUDE_INSTALL_REF` overrides the install/update branch for one run.
 `NVIDIACLAUDE_BIN_DIR` changes where the shell installer writes files.
 
@@ -175,7 +181,7 @@ nvidiaclaude reset             # alias for clearing stored tokens
 They replace the stored token list with a single token for compatibility with
 older installs.
 
-## Auto Failover
+## Auto Failover and Throttling
 
 When multiple tokens are configured, the local proxy automatically switches to
 the next token for token-specific failures:
@@ -189,6 +195,11 @@ responses, retry is safe before content output starts. If a token fails after
 partial streaming output, the proxy returns an SSE error for that response,
 marks the token as limited when possible, and uses another token on the next
 request.
+
+The proxy also slows requests before they reach NVIDIA's RPM cap. By default,
+each token is limited to `38` requests per `60` seconds. If all tokens are full,
+the request waits for the next available slot. Streaming sessions keep receiving
+SSE `ping` events while waiting.
 
 ## Manage Your Model
 

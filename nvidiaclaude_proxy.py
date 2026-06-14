@@ -14,6 +14,7 @@ import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -31,6 +32,8 @@ class ProxyConfig:
     timeout: float
     stream_ping_seconds: float
     token_cooldown_seconds: float
+    rate_limit_rpm: float
+    rate_limit_window_seconds: float
     token_manager: "TokenManager"
 
 
@@ -42,30 +45,112 @@ class ProviderError(Exception):
 
 
 class TokenManager:
-    def __init__(self, token_count: int, cooldown_seconds: float):
+    def __init__(
+        self,
+        token_count: int,
+        cooldown_seconds: float,
+        rate_limit_rpm: float = 38.0,
+        rate_limit_window_seconds: float = 60.0,
+    ):
         self.token_count = token_count
         self.cooldown_seconds = cooldown_seconds
+        self.rate_limit_count = max(0, int(rate_limit_rpm))
+        self.rate_limit_window_seconds = max(0.001, rate_limit_window_seconds)
         self.active_index = 0
         self.cooldown_until = [0.0 for _ in range(token_count)]
+        self.request_times = [deque() for _ in range(token_count)]
         self.lock = threading.Lock()
+        self.condition = threading.Condition(self.lock)
+
+    def ordered_indices(self) -> list[int]:
+        return list(range(self.active_index, self.token_count)) + list(range(0, self.active_index))
+
+    def prune_rate_window(self, index: int, now: float) -> None:
+        cutoff = now - self.rate_limit_window_seconds
+        request_times = self.request_times[index]
+        while request_times and request_times[0] <= cutoff:
+            request_times.popleft()
+
+    def rate_wait_seconds(self, index: int, now: float) -> float:
+        if self.rate_limit_count <= 0:
+            return 0.0
+        self.prune_rate_window(index, now)
+        request_times = self.request_times[index]
+        if len(request_times) < self.rate_limit_count:
+            return 0.0
+        return max(0.0, request_times[0] + self.rate_limit_window_seconds - now)
+
+    def best_candidate(self, excluded: set[int], now: float) -> tuple[int | None, float, str]:
+        best_index: int | None = None
+        best_wait = float("inf")
+        best_reason = "RPM limit"
+        for index in self.ordered_indices():
+            if index in excluded:
+                continue
+            cooldown_wait = max(0.0, self.cooldown_until[index] - now)
+            rate_wait = self.rate_wait_seconds(index, now)
+            wait_seconds = max(cooldown_wait, rate_wait)
+            reason = "cooldown" if cooldown_wait >= rate_wait and cooldown_wait > 0 else "RPM limit"
+            if wait_seconds <= 0:
+                return index, 0.0, reason
+            if wait_seconds < best_wait:
+                best_index = index
+                best_wait = wait_seconds
+                best_reason = reason
+        if best_index is None:
+            return None, 0.0, best_reason
+        return best_index, best_wait, best_reason
 
     def candidates(self) -> list[int]:
-        with self.lock:
+        with self.condition:
             now = time.time()
-            order = list(range(self.active_index, self.token_count)) + list(range(0, self.active_index))
-            available = [index for index in order if self.cooldown_until[index] <= now]
+            order = self.ordered_indices()
+            available = [
+                index
+                for index in order
+                if self.cooldown_until[index] <= now and self.rate_wait_seconds(index, now) <= 0
+            ]
             return available or order
 
+    def acquire_token(self, excluded: set[int] | None = None) -> int | None:
+        excluded = excluded or set()
+        while True:
+            with self.condition:
+                now = time.time()
+                index, wait_seconds, reason = self.best_candidate(excluded, now)
+                if index is None:
+                    return None
+                if wait_seconds <= 0:
+                    self.prune_rate_window(index, now)
+                    if self.rate_limit_count > 0:
+                        self.request_times[index].append(now)
+                    self.active_index = index
+                    return index
+
+                if reason == "cooldown":
+                    print(
+                        f"NVIDIA token #{index + 1} is cooling down; waiting {wait_seconds:.1f}s.",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"NVIDIA token #{index + 1} RPM limit reached; waiting {wait_seconds:.1f}s.",
+                        file=sys.stderr,
+                    )
+                self.condition.wait(wait_seconds)
+
     def mark_success(self, index: int) -> None:
-        with self.lock:
+        with self.condition:
             self.active_index = index
             self.cooldown_until[index] = 0.0
+            self.condition.notify_all()
 
     def mark_token_limited(self, index: int) -> None:
-        with self.lock:
+        with self.condition:
             self.cooldown_until[index] = time.time() + self.cooldown_seconds
             if self.active_index == index and self.token_count > 0:
                 self.active_index = (index + 1) % self.token_count
+            self.condition.notify_all()
 
 
 def json_dumps(data: Any) -> str:
@@ -446,7 +531,11 @@ def provider_request(config: ProxyConfig, payload: dict[str, Any], token_index: 
 
 def provider_request_with_failover(config: ProxyConfig, payload: dict[str, Any]) -> tuple[Any, int]:
     attempts: list[str] = []
-    for token_index in config.token_manager.candidates():
+    attempted: set[int] = set()
+    while True:
+        token_index = config.token_manager.acquire_token(attempted)
+        if token_index is None:
+            break
         try:
             response = provider_request(config, payload, token_index)
             config.token_manager.mark_success(token_index)
@@ -455,6 +544,7 @@ def provider_request_with_failover(config: ProxyConfig, payload: dict[str, Any])
             if not is_token_failover_error(error):
                 raise
             config.token_manager.mark_token_limited(token_index)
+            attempted.add(token_index)
             attempts.append(f"token #{token_index + 1}: HTTP {error.status}")
             print(
                 f"NVIDIA token #{token_index + 1} failed with HTTP {error.status}; trying next token.",
@@ -853,6 +943,11 @@ def main() -> int:
         if args.token_cooldown_seconds is not None
         else env_float("NVIDIACLAUDE_TOKEN_COOLDOWN_SECONDS", 60.0)
     )
+    rate_limit_rpm = env_float("NVIDIACLAUDE_RATE_LIMIT_RPM", 38.0)
+    rate_limit_window_seconds = max(
+        0.001,
+        env_float("NVIDIACLAUDE_RATE_LIMIT_WINDOW_SECONDS", 60.0),
+    )
 
     config = ProxyConfig(
         endpoint=normalize_endpoint(os.environ.get("NVIDIA_NIM_ENDPOINT", DEFAULT_ENDPOINT)),
@@ -861,7 +956,14 @@ def main() -> int:
         timeout=args.timeout,
         stream_ping_seconds=env_float("NVIDIACLAUDE_STREAM_PING_SECONDS", 2.0),
         token_cooldown_seconds=token_cooldown_seconds,
-        token_manager=TokenManager(len(api_keys), token_cooldown_seconds),
+        rate_limit_rpm=rate_limit_rpm,
+        rate_limit_window_seconds=rate_limit_window_seconds,
+        token_manager=TokenManager(
+            len(api_keys),
+            token_cooldown_seconds,
+            rate_limit_rpm,
+            rate_limit_window_seconds,
+        ),
     )
 
     server = ThreadingHTTPServer((args.host, args.port), make_handler(config))
