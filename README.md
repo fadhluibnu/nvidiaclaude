@@ -1,11 +1,13 @@
 # nvidiaclaude
 
 Run [Claude Code](https://docs.claude.com/en/docs/claude-code) against
-NVIDIA NIM through a local Anthropic-compatible adapter.
+OpenAI Chat Completions-compatible providers through a local
+Anthropic-compatible adapter.
 
-Install once, add one or more NVIDIA API tokens, and then run `nvidiaclaude`.
-The command starts a local proxy, points Claude Code at it, and forwards the
-requests to NVIDIA NIM.
+Install once, add one or more provider API tokens, and then run
+`nvidiaclaude`. The command starts a local proxy, points Claude Code at it, and
+forwards requests to the configured provider. NVIDIA NIM remains the default
+provider endpoint.
 
 > Requires the `claude` CLI and Python 3 to already be installed.
 
@@ -50,7 +52,7 @@ install directory is not on your `PATH`, the installer prints the next step.
 
 ## Use
 
-First run asks for your NVIDIA API token and saves it:
+First run asks for your provider API token and saves it:
 
 ```bash
 nvidiaclaude
@@ -78,8 +80,8 @@ nvidiaclaude commands
 nvidiaclaude [CLAUDE_ARGS...]
 ```
 
-Starts Claude Code through the local NVIDIA NIM adapter. Extra arguments pass
-through to the `claude` CLI.
+Starts Claude Code through the local OpenAI-compatible adapter. Extra
+arguments pass through to the `claude` CLI.
 
 ### API Key
 
@@ -96,7 +98,7 @@ nvidiaclaude reset
 `config` and `change-key` replace the stored token list with one token.
 `token add` appends another token for automatic failover. `token list` masks
 stored values, `token remove` deletes one token by index, and `token clear` or
-`reset` removes all stored tokens without removing the stored model.
+`reset` removes all stored tokens without removing the stored model or endpoint.
 
 ### Model
 
@@ -109,6 +111,19 @@ nvidiaclaude reset-model
 
 Use `change-model` or `set-model` to persist a model. Use `model` to show the
 model new runs will use. Use `reset-model` to return to the default model.
+
+### Endpoint
+
+```bash
+nvidiaclaude change-endpoint <URL>
+nvidiaclaude set-endpoint <URL>
+nvidiaclaude endpoint
+nvidiaclaude reset-endpoint
+```
+
+Use `change-endpoint` or `set-endpoint` to persist a provider endpoint. Use
+`endpoint` to show the endpoint new runs will use. Use `reset-endpoint` to
+return to the default NVIDIA endpoint.
 
 ### Maintenance
 
@@ -126,6 +141,10 @@ for `commands`: `help`, `--help-nvidiaclaude`.
 ### Environment Overrides
 
 ```bash
+NVIDIACLAUDE_API_KEY=<KEY> nvidiaclaude
+NVIDIACLAUDE_API_KEYS=<KEY1>,<KEY2> nvidiaclaude
+NVIDIACLAUDE_MODEL=<MODEL> nvidiaclaude
+NVIDIACLAUDE_API_ENDPOINT=<URL> nvidiaclaude
 NVIDIA_API_KEY=<KEY> nvidiaclaude
 NVIDIA_API_KEYS=<KEY1>,<KEY2> nvidiaclaude
 NVIDIA_NIM_MODEL=<MODEL> nvidiaclaude
@@ -139,14 +158,15 @@ NVIDIACLAUDE_INSTALL_REF=dev nvidiaclaude update
 NVIDIACLAUDE_BIN_DIR=<DIR> ./install.sh
 ```
 
-`NVIDIA_API_KEY` or `NVIDIA_API_KEYS` is saved for next time if no token is
-stored yet.
-`NVIDIA_NIM_MODEL` and `NVIDIA_NIM_ENDPOINT` override config for one run.
+`NVIDIACLAUDE_API_KEY` or `NVIDIACLAUDE_API_KEYS` is saved for next time if no
+token is stored yet. `NVIDIA_API_KEY` and `NVIDIA_API_KEYS` are legacy aliases.
+`NVIDIACLAUDE_MODEL` and `NVIDIACLAUDE_API_ENDPOINT` override config for one
+run. `NVIDIA_NIM_MODEL` and `NVIDIA_NIM_ENDPOINT` are legacy aliases.
 `NVIDIACLAUDE_STREAM_PING_SECONDS` controls stream heartbeat pings while
-waiting for NVIDIA NIM chunks. Set it to `0` to disable pings.
+waiting for provider chunks. Set it to `0` to disable pings.
 `NVIDIACLAUDE_TOKEN_COOLDOWN_SECONDS` controls how long a failed token is
 avoided after token auth, quota, or rate-limit errors. Default: `60`.
-`NVIDIACLAUDE_RATE_LIMIT_RPM` proactively throttles NVIDIA requests. Default:
+`NVIDIACLAUDE_RATE_LIMIT_RPM` proactively throttles provider requests. Default:
 `38`; set it to `0` to disable proactive throttling.
 `NVIDIACLAUDE_RATE_LIMIT_SCOPE` can be `global` or `per-token`. Default:
 `global`.
@@ -167,9 +187,11 @@ Default: `60`.
 Tokens are resolved in this order:
 
 1. Stored config file.
-2. `NVIDIA_API_KEYS` environment variable, comma-separated.
-3. `NVIDIA_API_KEY` environment variable.
-4. Interactive prompt - asked for automatically if none of the above is set.
+2. `NVIDIACLAUDE_API_KEYS` environment variable, comma-separated.
+3. `NVIDIACLAUDE_API_KEY` environment variable.
+4. `NVIDIA_API_KEYS` environment variable, comma-separated legacy alias.
+5. `NVIDIA_API_KEY` environment variable, legacy alias.
+6. Interactive prompt - asked for automatically if none of the above is set.
 
 ## Manage Your Tokens
 
@@ -201,11 +223,11 @@ immediately tries the next ready token. If every configured token is cooling
 down after provider rate-limit responses, the request fails with a clear error
 so Claude Code can stop instead of waiting for a long internal retry loop.
 
-The proxy also has a silent proactive RPM throttle to avoid hitting NVIDIA's
-shared request-per-minute limits. When the shared RPM bucket is full, the proxy
-waits internally and does not print `NVIDIA shared RPM limit reached` messages
-to your terminal. Use `NVIDIACLAUDE_RATE_LIMIT_SCOPE=per-token` only when your
-tokens are known to have separate RPM buckets.
+The proxy also has a silent proactive RPM throttle to avoid hitting provider
+request-per-minute limits. When the shared RPM bucket is full, the proxy waits
+internally without printing rate-limit noise to your terminal. Use
+`NVIDIACLAUDE_RATE_LIMIT_SCOPE=per-token` only when your tokens are known to
+have separate RPM buckets.
 
 For streaming responses, failover is safe before content output starts. If a
 token fails after partial streaming output, the proxy returns an SSE error for
@@ -213,7 +235,7 @@ that response and avoids that token for the cooldown window.
 
 ## Manage Your Model
 
-Change the stored NVIDIA NIM model without reinstalling:
+Change the stored provider model without reinstalling:
 
 ```bash
 nvidiaclaude change-model <MODEL>
@@ -234,9 +256,11 @@ nvidiaclaude reset-model
 
 The model is resolved in this order:
 
-1. `NVIDIA_NIM_MODEL` environment variable for a one-off run.
-2. The stored config file.
-3. The default model, `minimaxai/minimax-m3`.
+1. `NVIDIACLAUDE_MODEL` environment variable for a one-off run.
+2. `NVIDIA_NIM_MODEL` environment variable, legacy alias.
+3. The stored config file, preferring `NVIDIACLAUDE_MODEL` over legacy
+   `NVIDIA_NIM_MODEL`.
+4. The default model, `minimaxai/minimax-m3`.
 
 Changing the stored model affects the next `nvidiaclaude` run. A process that
 is already running keeps the model that was selected when its local proxy
@@ -263,35 +287,89 @@ NVIDIACLAUDE_INSTALL_REF=dev nvidiaclaude update
 Tokens are stored in plaintext on your machine. Treat them like any other local
 credential.
 
-## NVIDIA NIM Settings
+## Provider Endpoint
 
 By default, `nvidiaclaude` uses:
 
 ```sh
-NVIDIA_NIM_ENDPOINT="https://integrate.api.nvidia.com/v1/chat/completions"
-NVIDIA_NIM_MODEL="minimaxai/minimax-m3"
+NVIDIACLAUDE_API_ENDPOINT="https://integrate.api.nvidia.com/v1/chat/completions"
+NVIDIACLAUDE_MODEL="minimaxai/minimax-m3"
 ```
 
-You can override either setting for a single run:
+Change the stored provider endpoint without reinstalling:
+
+```bash
+nvidiaclaude change-endpoint https://api.tokenrouter.com/v1
+nvidiaclaude set-endpoint https://api.tokenrouter.com/v1
+```
+
+Show the endpoint that new runs will use:
+
+```bash
+nvidiaclaude endpoint
+```
+
+Return to the default NVIDIA endpoint:
+
+```bash
+nvidiaclaude reset-endpoint
+```
+
+The endpoint can be either a provider base URL ending in `/v1` or the full Chat
+Completions URL. These two TokenRouter values are equivalent:
+
+```bash
+https://api.tokenrouter.com/v1
+https://api.tokenrouter.com/v1/chat/completions
+```
+
+Internally, `nvidiaclaude` sends requests to `/chat/completions`. If you provide
+`https://api.tokenrouter.com/v1`, it is normalized to
+`https://api.tokenrouter.com/v1/chat/completions`. For normal use, prefer the
+shorter `/v1` form; use the full URL when a provider documents a custom Chat
+Completions path.
+
+You can override endpoint or model for a single run:
+
+```bash
+NVIDIACLAUDE_MODEL="minimaxai/minimax-m3" nvidiaclaude
+NVIDIACLAUDE_API_ENDPOINT="https://api.tokenrouter.com/v1" nvidiaclaude
+```
+
+Legacy NVIDIA-specific env names still work:
 
 ```bash
 NVIDIA_NIM_MODEL="minimaxai/minimax-m3" nvidiaclaude
 NVIDIA_NIM_ENDPOINT="https://integrate.api.nvidia.com/v1/chat/completions" nvidiaclaude
 ```
 
-To persist a model choice:
+The endpoint is resolved in this order:
+
+1. `NVIDIACLAUDE_API_ENDPOINT` environment variable for a one-off run.
+2. `NVIDIA_NIM_ENDPOINT` environment variable, legacy alias.
+3. The stored config file, preferring `NVIDIACLAUDE_API_ENDPOINT` over legacy
+   `NVIDIA_NIM_ENDPOINT`.
+4. The default NVIDIA endpoint.
+
+### TokenRouter Example
 
 ```bash
-nvidiaclaude change-model minimaxai/minimax-m3
+nvidiaclaude change-endpoint https://api.tokenrouter.com/v1
+nvidiaclaude change-model <TOKENROUTER_MODEL>
+nvidiaclaude token add <TOKENROUTER_API_KEY>
+nvidiaclaude
 ```
+
+Use the model name exactly as TokenRouter documents it. TokenRouter must expose
+an OpenAI-compatible Chat Completions API for the selected model.
 
 ## Streaming Heartbeat
 
-Some NVIDIA NIM models spend time in an internal thinking phase before the
-first visible token. During that wait, `nvidiaclaude` sends Anthropic-compatible
-SSE `ping` events so Claude Code can see that the stream is still active.
+Some provider models spend time in an internal thinking phase before the first
+visible token. During that wait, `nvidiaclaude` sends Anthropic-compatible SSE
+`ping` events so Claude Code can see that the stream is still active.
 
-By default, a ping is sent every 2 seconds while no NVIDIA NIM stream chunk is
+By default, a ping is sent every 2 seconds while no provider stream chunk is
 available. To change the interval for one run:
 
 ```bash

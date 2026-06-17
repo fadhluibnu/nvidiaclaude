@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local Anthropic-compatible adapter for NVIDIA NIM chat completions."""
+"""Local Anthropic-compatible adapter for OpenAI chat completions providers."""
 
 from __future__ import annotations
 
@@ -244,11 +244,34 @@ def split_api_keys(value: str) -> list[str]:
 
 
 def load_api_keys_from_env() -> list[str]:
+    multi = os.environ.get("NVIDIACLAUDE_API_KEYS", "").strip()
+    if multi:
+        return split_api_keys(multi)
+    single = os.environ.get("NVIDIACLAUDE_API_KEY", "").strip()
+    if single:
+        return [single]
+
     multi = os.environ.get("NVIDIA_API_KEYS", "").strip()
     if multi:
         return split_api_keys(multi)
     single = os.environ.get("NVIDIA_API_KEY", "").strip()
     return [single] if single else []
+
+
+def load_endpoint_from_env() -> str:
+    endpoint = os.environ.get("NVIDIACLAUDE_API_ENDPOINT", "").strip()
+    if endpoint:
+        return endpoint
+    endpoint = os.environ.get("NVIDIA_NIM_ENDPOINT", "").strip()
+    return endpoint or DEFAULT_ENDPOINT
+
+
+def load_model_from_env() -> str:
+    model = os.environ.get("NVIDIACLAUDE_MODEL", "").strip()
+    if model:
+        return model
+    model = os.environ.get("NVIDIA_NIM_MODEL", "").strip()
+    return model or DEFAULT_MODEL
 
 
 def is_rate_limit_error(error: ProviderError) -> bool:
@@ -625,7 +648,7 @@ def provider_request_with_failover(config: ProxyConfig, payload: dict[str, Any])
                 attempts.append(f"token #{token_index + 1}: HTTP {status}")
                 last_token_failure_status = status
                 debug_log(
-                    f"NVIDIA token #{token_index + 1} is rate limited with HTTP {status}; "
+                    f"Provider token #{token_index + 1} is rate limited with HTTP {status}; "
                     f"cooling down for {cooldown:.1f}s and trying next token."
                 )
                 continue
@@ -636,7 +659,7 @@ def provider_request_with_failover(config: ProxyConfig, payload: dict[str, Any])
             attempts.append(f"token #{token_index + 1}: HTTP {error.status}")
             last_token_failure_status = error.status
             debug_log(
-                f"NVIDIA token #{token_index + 1} failed with HTTP {error.status}; "
+                f"Provider token #{token_index + 1} failed with HTTP {error.status}; "
                 "trying next token."
             )
 
@@ -646,17 +669,17 @@ def provider_request_with_failover(config: ProxyConfig, payload: dict[str, Any])
         if wait_seconds is not None and wait_seconds > 0:
             raise ProviderError(
                 429,
-                "All configured NVIDIA API tokens are currently cooling down "
+                "All configured provider API tokens are currently cooling down "
                 f"or rate limited; next token may be available in {wait_seconds:.1f}s.",
             )
     if attempts and rate_limited_attempts == len(attempts):
         raise ProviderError(
             last_token_failure_status,
-            f"All configured NVIDIA API tokens are currently rate limited ({detail}).",
+            f"All configured provider API tokens are currently rate limited ({detail}).",
         )
     raise ProviderError(
         last_token_failure_status,
-        f"All configured NVIDIA API tokens failed ({detail}).",
+        f"All configured provider API tokens failed ({detail}).",
     )
 
 
@@ -788,10 +811,10 @@ class NvidiaClaudeHandler(BaseHTTPRequestHandler):
             with response:
                 data = json.loads(response.read().decode("utf-8"))
         except ProviderError as error:
-            self.send_error_json(error.status, f"NVIDIA NIM error: {error.message}")
+            self.send_error_json(error.status, f"Provider error: {error.message}")
             return
         except Exception as error:
-            self.send_error_json(502, f"NVIDIA NIM request failed: {error}")
+            self.send_error_json(502, f"Provider request failed: {error}")
             return
 
         self.send_json(200, convert_openai_response(data, self.config.model))
@@ -854,7 +877,7 @@ class NvidiaClaudeHandler(BaseHTTPRequestHandler):
                         "type": "error",
                         "error": {
                             "type": "api_error",
-                            "message": f"NVIDIA NIM error: {error.message}",
+                            "message": f"Provider error: {error.message}",
                         },
                     })
                     return
@@ -865,7 +888,7 @@ class NvidiaClaudeHandler(BaseHTTPRequestHandler):
                         "type": "error",
                         "error": {
                             "type": "api_error",
-                            "message": f"NVIDIA NIM stream failed: {error}",
+                            "message": f"Provider stream failed: {error}",
                         },
                     })
                     return
@@ -904,7 +927,7 @@ class NvidiaClaudeHandler(BaseHTTPRequestHandler):
                         "type": "error",
                         "error": {
                             "type": "api_error",
-                            "message": f"NVIDIA NIM stream failed: {message}",
+                            "message": f"Provider stream failed: {message}",
                         },
                     })
                     return
@@ -1003,7 +1026,7 @@ class NvidiaClaudeHandler(BaseHTTPRequestHandler):
                     "type": "error",
                     "error": {
                         "type": "api_error",
-                        "message": f"NVIDIA NIM stream failed: {error}",
+                        "message": f"Provider stream failed: {error}",
                     },
                 })
             except BrokenPipeError:
@@ -1019,7 +1042,9 @@ def make_handler(config: ProxyConfig) -> type[NvidiaClaudeHandler]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Anthropic-compatible NVIDIA NIM proxy.")
+    parser = argparse.ArgumentParser(
+        description="Anthropic-compatible OpenAI chat completions proxy."
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--ready-file")
@@ -1049,7 +1074,10 @@ def main() -> int:
     args = parse_args()
     api_keys = load_api_keys_from_env()
     if not api_keys:
-        print("NVIDIA_API_KEY or NVIDIA_API_KEYS is required.", file=sys.stderr)
+        print(
+            "NVIDIACLAUDE_API_KEY(S) or NVIDIA_API_KEY(S) is required.",
+            file=sys.stderr,
+        )
         return 1
     token_cooldown_seconds = (
         max(0.0, args.token_cooldown_seconds)
@@ -1064,9 +1092,9 @@ def main() -> int:
     )
 
     config = ProxyConfig(
-        endpoint=normalize_endpoint(os.environ.get("NVIDIA_NIM_ENDPOINT", DEFAULT_ENDPOINT)),
+        endpoint=normalize_endpoint(load_endpoint_from_env()),
         api_keys=api_keys,
-        model=os.environ.get("NVIDIA_NIM_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL,
+        model=load_model_from_env(),
         timeout=args.timeout,
         stream_ping_seconds=env_float("NVIDIACLAUDE_STREAM_PING_SECONDS", 2.0),
         token_cooldown_seconds=token_cooldown_seconds,

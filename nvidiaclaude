@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 #
-# nvidiaclaude - run Claude Code against NVIDIA NIM through a local adapter.
+# nvidiaclaude - run Claude Code against OpenAI-compatible providers through a local adapter.
 #
 # Key resolution order:
 #   1. stored config file          - set by config/token subcommands
-#   2. NVIDIA_API_KEYS env var     - comma-separated keys, saved for next time
-#   3. NVIDIA_API_KEY env var      - single key, saved for next time
-#   4. interactive prompt          - asks for a key if needed
+#   2. NVIDIACLAUDE_API_KEYS env var - comma-separated keys, saved for next time
+#   3. NVIDIACLAUDE_API_KEY env var  - single key, saved for next time
+#   4. NVIDIA_API_KEYS env var       - legacy comma-separated keys, saved for next time
+#   5. NVIDIA_API_KEY env var        - legacy single key, saved for next time
+#   6. interactive prompt            - asks for a key if needed
 #
 set -euo pipefail
 
@@ -100,8 +102,15 @@ read_config_keys() {
         value="$(trim "${line#NVIDIA_API_KEY=}")"
         [ -n "$value" ] && printf '%s\n' "$value"
         ;;
+      NVIDIACLAUDE_API_KEY=*)
+        value="$(trim "${line#NVIDIACLAUDE_API_KEY=}")"
+        [ -n "$value" ] && printf '%s\n' "$value"
+        ;;
       NVIDIA_API_KEYS=*)
         parse_key_csv "${line#NVIDIA_API_KEYS=}"
+        ;;
+      NVIDIACLAUDE_API_KEYS=*)
+        parse_key_csv "${line#NVIDIACLAUDE_API_KEYS=}"
         ;;
     esac
   done < "$CONFIG_FILE"
@@ -119,7 +128,13 @@ load_config_keys() {
 load_env_keys() {
   local key
   TOKENS=()
-  if [ -n "${NVIDIA_API_KEYS:-}" ]; then
+  if [ -n "${NVIDIACLAUDE_API_KEYS:-}" ]; then
+    while IFS= read -r key || [ -n "$key" ]; do
+      add_unique_token "$key"
+    done < <(parse_key_csv "$NVIDIACLAUDE_API_KEYS")
+  elif [ -n "${NVIDIACLAUDE_API_KEY:-}" ]; then
+    add_unique_token "$NVIDIACLAUDE_API_KEY"
+  elif [ -n "${NVIDIA_API_KEYS:-}" ]; then
     while IFS= read -r key || [ -n "$key" ]; do
       add_unique_token "$key"
     done < <(parse_key_csv "$NVIDIA_API_KEYS")
@@ -184,13 +199,13 @@ save_keys() {
   if [ -f "$CONFIG_FILE" ]; then
     while IFS= read -r line || [ -n "$line" ]; do
       case "$line" in
-        NVIDIA_API_KEY=*|NVIDIA_API_KEYS=*) ;;
+        NVIDIACLAUDE_API_KEY=*|NVIDIACLAUDE_API_KEYS=*|NVIDIA_API_KEY=*|NVIDIA_API_KEYS=*) ;;
         *) printf '%s\n' "$line" >> "$tmp" ;;
       esac
     done < "$CONFIG_FILE"
   fi
   for key in "${keys[@]}"; do
-    printf 'NVIDIA_API_KEY=%s\n' "$key" >> "$tmp"
+    printf 'NVIDIACLAUDE_API_KEY=%s\n' "$key" >> "$tmp"
   done
   chmod 600 "$tmp"
   mv "$tmp" "$CONFIG_FILE"
@@ -222,7 +237,7 @@ remove_all_keys() {
   tmp="$(mktemp "$CONFIG_DIR/config.XXXXXX")"
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
-      NVIDIA_API_KEY=*|NVIDIA_API_KEYS=*) ;;
+      NVIDIACLAUDE_API_KEY=*|NVIDIACLAUDE_API_KEYS=*|NVIDIA_API_KEY=*|NVIDIA_API_KEYS=*) ;;
       *) printf '%s\n' "$line" >> "$tmp" ;;
     esac
   done < "$CONFIG_FILE"
@@ -241,19 +256,52 @@ save_model() {
     say "Refusing to save an empty model."
     return 1
   fi
-  set_config_value NVIDIA_NIM_MODEL "$model"
+  set_config_value NVIDIACLAUDE_MODEL "$model"
   say "Model saved to $CONFIG_FILE"
 }
 
 configured_model() {
-  local model
-  model="$(read_config_value NVIDIA_NIM_MODEL)"
-  if [ -n "${NVIDIA_NIM_MODEL:-}" ]; then
+  local model legacy_model
+  model="$(read_config_value NVIDIACLAUDE_MODEL)"
+  legacy_model="$(read_config_value NVIDIA_NIM_MODEL)"
+  if [ -n "${NVIDIACLAUDE_MODEL:-}" ]; then
+    printf '%s' "$(trim "$NVIDIACLAUDE_MODEL")"
+  elif [ -n "${NVIDIA_NIM_MODEL:-}" ]; then
     printf '%s' "$(trim "$NVIDIA_NIM_MODEL")"
   elif [ -n "$model" ]; then
     printf '%s' "$(trim "$model")"
+  elif [ -n "$legacy_model" ]; then
+    printf '%s' "$(trim "$legacy_model")"
   else
     printf '%s' "$DEFAULT_MODEL"
+  fi
+}
+
+save_endpoint() {
+  local endpoint
+  endpoint="$(trim "$1")"
+  if [ -z "$endpoint" ]; then
+    say "Refusing to save an empty endpoint."
+    return 1
+  fi
+  set_config_value NVIDIACLAUDE_API_ENDPOINT "$endpoint"
+  say "Endpoint saved to $CONFIG_FILE"
+}
+
+configured_endpoint() {
+  local endpoint legacy_endpoint
+  endpoint="$(read_config_value NVIDIACLAUDE_API_ENDPOINT)"
+  legacy_endpoint="$(read_config_value NVIDIA_NIM_ENDPOINT)"
+  if [ -n "${NVIDIACLAUDE_API_ENDPOINT:-}" ]; then
+    printf '%s' "$(trim "$NVIDIACLAUDE_API_ENDPOINT")"
+  elif [ -n "${NVIDIA_NIM_ENDPOINT:-}" ]; then
+    printf '%s' "$(trim "$NVIDIA_NIM_ENDPOINT")"
+  elif [ -n "$endpoint" ]; then
+    printf '%s' "$(trim "$endpoint")"
+  elif [ -n "$legacy_endpoint" ]; then
+    printf '%s' "$(trim "$legacy_endpoint")"
+  else
+    printf '%s' "$DEFAULT_ENDPOINT"
   fi
 }
 
@@ -292,13 +340,13 @@ interactive_setup() {
   say "|  nvidiaclaude - first-time setup         |"
   say "+------------------------------------------+"
   say ""
-  say "Claude Code will run against NVIDIA NIM."
-  say "You only need to enter your NVIDIA API key once."
+  say "Claude Code will run against your configured provider."
+  say "You only need to enter your provider API key once."
   say "Additional tokens can be added later with: nvidiaclaude token add"
   say ""
   local key="" tries=0
   while :; do
-    key="$(trim "$(read_secret 'NVIDIA API key: ')")"
+    key="$(trim "$(read_secret 'Provider API key: ')")"
     [ -n "$key" ] && break
     tries=$((tries + 1))
     say "Key can't be empty."
@@ -327,7 +375,7 @@ token_command() {
       if [ "${3:-}" != "" ]; then
         key="$(trim "$3")"
       else
-        key="$(trim "$(read_secret 'NVIDIA API key: ')")"
+        key="$(trim "$(read_secret 'Provider API key: ')")"
       fi
       if [ -z "$key" ]; then
         say "Token can't be empty."
@@ -346,7 +394,7 @@ token_command() {
     list|ls)
       load_config_keys
       if [ "${#TOKENS[@]}" -eq 0 ]; then
-        printf '%s\n' "No stored NVIDIA API tokens."
+        printf '%s\n' "No stored provider API tokens."
       else
         local i=1
         for key in "${TOKENS[@]}"; do
@@ -402,12 +450,12 @@ nvidiaclaude command reference
 
 Start
   nvidiaclaude [CLAUDE_ARGS...]
-      Start Claude Code through the local NVIDIA NIM adapter.
+      Start Claude Code through the local OpenAI-compatible adapter.
       Any extra arguments are passed through to the claude CLI.
 
 API key
   nvidiaclaude config <KEY>
-      Replace the stored token list with one NVIDIA API token.
+      Replace the stored token list with one provider API token.
 
   nvidiaclaude change-key [KEY]
       Replace the stored token list. If KEY is omitted, nvidiaclaude asks
@@ -415,7 +463,7 @@ API key
       Aliases: config, set-key, change
 
   nvidiaclaude token add [KEY]
-      Add another NVIDIA API token for automatic failover.
+      Add another provider API token for automatic failover.
 
   nvidiaclaude token list
       List saved tokens with masked values.
@@ -424,14 +472,14 @@ API key
       Remove one saved token by index from token list.
 
   nvidiaclaude token clear
-      Remove all saved tokens. The stored model is kept.
+      Remove all saved tokens. Stored model and endpoint are kept.
 
   nvidiaclaude reset
-      Remove all saved tokens. The stored model is kept.
+      Remove all saved tokens. Stored model and endpoint are kept.
 
 Model
   nvidiaclaude change-model <MODEL>
-      Save the NVIDIA NIM model used by future nvidiaclaude runs.
+      Save the provider model used by future nvidiaclaude runs.
 
   nvidiaclaude set-model <MODEL>
       Alias for change-model.
@@ -443,6 +491,21 @@ Model
   nvidiaclaude reset-model
       Remove the stored model and return to the default model:
       $DEFAULT_MODEL
+
+Endpoint
+  nvidiaclaude change-endpoint <URL>
+      Save the provider endpoint used by future nvidiaclaude runs.
+
+  nvidiaclaude set-endpoint <URL>
+      Alias for change-endpoint.
+
+  nvidiaclaude endpoint
+      Show the endpoint new runs will use after applying env/config/default
+      precedence.
+
+  nvidiaclaude reset-endpoint
+      Remove the stored endpoint and return to the default endpoint:
+      $DEFAULT_ENDPOINT
 
 Maintenance
   nvidiaclaude update
@@ -458,30 +521,42 @@ Maintenance
       Aliases: help, --help-nvidiaclaude
 
 Environment overrides
-  NVIDIA_API_KEY
+  NVIDIACLAUDE_API_KEY
       Use this token if no token is stored yet. It will be saved for next time.
 
-  NVIDIA_API_KEYS
+  NVIDIACLAUDE_API_KEYS
       Comma-separated token list if no token is stored yet. It will be saved
       for next time.
 
-  NVIDIA_NIM_MODEL
+  NVIDIA_API_KEY
+      Legacy alias for NVIDIACLAUDE_API_KEY.
+
+  NVIDIA_API_KEYS
+      Legacy alias for NVIDIACLAUDE_API_KEYS.
+
+  NVIDIACLAUDE_MODEL
       Override the configured model for one run.
 
-  NVIDIA_NIM_ENDPOINT
-      Override the NVIDIA NIM endpoint for one run.
+  NVIDIA_NIM_MODEL
+      Legacy alias for NVIDIACLAUDE_MODEL.
+
+  NVIDIACLAUDE_API_ENDPOINT
+      Override the configured provider endpoint for one run.
       Default: $DEFAULT_ENDPOINT
 
+  NVIDIA_NIM_ENDPOINT
+      Legacy alias for NVIDIACLAUDE_API_ENDPOINT.
+
   NVIDIACLAUDE_STREAM_PING_SECONDS
-      Send Anthropic SSE ping events while waiting for NVIDIA NIM stream
+      Send Anthropic SSE ping events while waiting for provider stream
       chunks. Default: 2. Set to 0 to disable.
 
   NVIDIACLAUDE_TOKEN_COOLDOWN_SECONDS
       Seconds to avoid a token after a token-specific failure, including
-      NVIDIA 429 rate-limit responses. Default: 60.
+      provider 429 rate-limit responses. Default: 60.
 
   NVIDIACLAUDE_RATE_LIMIT_RPM
-      Maximum NVIDIA requests per shared rate-limit window. Default: 38.
+      Maximum provider requests per shared rate-limit window. Default: 38.
       Set to 0 to disable proactive throttling.
 
   NVIDIACLAUDE_RATE_LIMIT_SCOPE
@@ -656,8 +731,28 @@ case "${1:-}" in
     exit 0
     ;;
   reset-model|--reset-model)
+    remove_config_value NVIDIACLAUDE_MODEL
     remove_config_value NVIDIA_NIM_MODEL
     say "Stored model removed. New runs will use default model: $DEFAULT_MODEL"
+    exit 0
+    ;;
+  change-endpoint|--change-endpoint|set-endpoint|--set-endpoint)
+    if [ "${2:-}" = "" ]; then
+      say "Usage: nvidiaclaude change-endpoint <URL>"
+      exit 1
+    fi
+    save_endpoint "$2"
+    say "Done. New runs will use endpoint: $(configured_endpoint)"
+    exit 0
+    ;;
+  endpoint|--endpoint|current-endpoint|--current-endpoint)
+    printf '%s\n' "$(configured_endpoint)"
+    exit 0
+    ;;
+  reset-endpoint|--reset-endpoint)
+    remove_config_value NVIDIACLAUDE_API_ENDPOINT
+    remove_config_value NVIDIA_NIM_ENDPOINT
+    say "Stored endpoint removed. New runs will use default endpoint: $DEFAULT_ENDPOINT"
     exit 0
     ;;
   reset|--reset)
@@ -684,7 +779,7 @@ load_config_keys
 if [ "${#TOKENS[@]}" -eq 0 ]; then
   load_env_keys
   if [ "${#TOKENS[@]}" -gt 0 ]; then
-    say "Using NVIDIA API token(s) from environment; saving for next time."
+    say "Using provider API token(s) from environment; saving for next time."
     save_keys "${TOKENS[@]}" || true
   fi
 fi
@@ -705,10 +800,14 @@ if ! command -v claude >/dev/null 2>&1; then
   exit 127
 fi
 
-export NVIDIA_API_KEY="${TOKENS[0]}"
-export NVIDIA_API_KEYS="$(join_keys "${TOKENS[@]}")"
-export NVIDIA_NIM_ENDPOINT="${NVIDIA_NIM_ENDPOINT:-$DEFAULT_ENDPOINT}"
-export NVIDIA_NIM_MODEL="$(configured_model)"
+export NVIDIACLAUDE_API_KEY="${TOKENS[0]}"
+export NVIDIACLAUDE_API_KEYS="$(join_keys "${TOKENS[@]}")"
+export NVIDIA_API_KEY="$NVIDIACLAUDE_API_KEY"
+export NVIDIA_API_KEYS="$NVIDIACLAUDE_API_KEYS"
+export NVIDIACLAUDE_API_ENDPOINT="$(configured_endpoint)"
+export NVIDIA_NIM_ENDPOINT="$NVIDIACLAUDE_API_ENDPOINT"
+export NVIDIACLAUDE_MODEL="$(configured_model)"
+export NVIDIA_NIM_MODEL="$NVIDIACLAUDE_MODEL"
 
 trap cleanup_proxy EXIT INT TERM
 PORT="$(start_proxy)"

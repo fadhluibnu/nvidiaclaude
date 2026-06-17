@@ -1,10 +1,12 @@
-# nvidiaclaude - run Claude Code against NVIDIA NIM through a local adapter.
+# nvidiaclaude - run Claude Code against OpenAI-compatible providers through a local adapter.
 #
 # Key resolution order:
 #   1. stored config file          - set by config/token subcommands
-#   2. $env:NVIDIA_API_KEYS        - comma-separated keys, saved for next time
-#   3. $env:NVIDIA_API_KEY         - single key, saved for next time
-#   4. interactive prompt          - asks for a key if needed
+#   2. $env:NVIDIACLAUDE_API_KEYS - comma-separated keys, saved for next time
+#   3. $env:NVIDIACLAUDE_API_KEY  - single key, saved for next time
+#   4. $env:NVIDIA_API_KEYS       - legacy comma-separated keys, saved for next time
+#   5. $env:NVIDIA_API_KEY        - legacy single key, saved for next time
+#   6. interactive prompt         - asks for a key if needed
 
 $ErrorActionPreference = 'Stop'
 
@@ -37,13 +39,16 @@ function Save-Keys([string[]]$Keys) {
   $lines = @()
   if (Test-Path $ConfigFile) {
     foreach ($line in Get-Content $ConfigFile) {
-      if (($line -notlike 'NVIDIA_API_KEY=*') -and ($line -notlike 'NVIDIA_API_KEYS=*')) {
+      if (($line -notlike 'NVIDIACLAUDE_API_KEY=*') -and
+          ($line -notlike 'NVIDIACLAUDE_API_KEYS=*') -and
+          ($line -notlike 'NVIDIA_API_KEY=*') -and
+          ($line -notlike 'NVIDIA_API_KEYS=*')) {
         $lines += $line
       }
     }
   }
   foreach ($key in $clean) {
-    $lines += "NVIDIA_API_KEY=$key"
+    $lines += "NVIDIACLAUDE_API_KEY=$key"
   }
   Set-Content -Path $ConfigFile -Value $lines -Encoding ASCII
   try {
@@ -67,7 +72,10 @@ function Remove-AllKeys {
   if (-not (Test-Path $ConfigFile)) { return }
   $lines = @()
   foreach ($line in Get-Content $ConfigFile) {
-    if (($line -notlike 'NVIDIA_API_KEY=*') -and ($line -notlike 'NVIDIA_API_KEYS=*')) {
+    if (($line -notlike 'NVIDIACLAUDE_API_KEY=*') -and
+        ($line -notlike 'NVIDIACLAUDE_API_KEYS=*') -and
+        ($line -notlike 'NVIDIA_API_KEY=*') -and
+        ($line -notlike 'NVIDIA_API_KEYS=*')) {
       $lines += $line
     }
   }
@@ -90,7 +98,18 @@ function Get-ConfigKeys {
   $keys = @()
   if (-not (Test-Path $ConfigFile)) { return $keys }
   foreach ($line in Get-Content $ConfigFile) {
-    if ($line -like 'NVIDIA_API_KEY=*') {
+    if ($line -like 'NVIDIACLAUDE_API_KEY=*') {
+      $value = $line.Substring('NVIDIACLAUDE_API_KEY='.Length).Trim()
+      if ($value -and ($keys -notcontains $value)) {
+        $keys += $value
+      }
+    } elseif ($line -like 'NVIDIACLAUDE_API_KEYS=*') {
+      foreach ($value in (Split-KeyCsv $line.Substring('NVIDIACLAUDE_API_KEYS='.Length))) {
+        if ($value -and ($keys -notcontains $value)) {
+          $keys += $value
+        }
+      }
+    } elseif ($line -like 'NVIDIA_API_KEY=*') {
       $value = $line.Substring('NVIDIA_API_KEY='.Length).Trim()
       if ($value -and ($keys -notcontains $value)) {
         $keys += $value
@@ -107,6 +126,13 @@ function Get-ConfigKeys {
 }
 
 function Get-EnvKeys {
+  if ($env:NVIDIACLAUDE_API_KEYS) {
+    return Split-KeyCsv $env:NVIDIACLAUDE_API_KEYS
+  }
+  if ($env:NVIDIACLAUDE_API_KEY) {
+    $key = $env:NVIDIACLAUDE_API_KEY.Trim()
+    if ($key) { return @($key) }
+  }
   if ($env:NVIDIA_API_KEYS) {
     return Split-KeyCsv $env:NVIDIA_API_KEYS
   }
@@ -185,7 +211,7 @@ function Save-Model([string]$Model) {
     Write-Host 'Refusing to save an empty model.'
     return
   }
-  Set-ConfigValue 'NVIDIA_NIM_MODEL' $Model
+  Set-ConfigValue 'NVIDIACLAUDE_MODEL' $Model
   Write-Host "Model saved to $ConfigFile"
 }
 
@@ -200,10 +226,33 @@ function Get-ConfigValue([string]$Name) {
 }
 
 function Get-ConfiguredModel {
+  if ($env:NVIDIACLAUDE_MODEL) { return $env:NVIDIACLAUDE_MODEL.Trim() }
   if ($env:NVIDIA_NIM_MODEL) { return $env:NVIDIA_NIM_MODEL.Trim() }
+  $model = Get-ConfigValue 'NVIDIACLAUDE_MODEL'
+  if ($model) { return $model.Trim() }
   $model = Get-ConfigValue 'NVIDIA_NIM_MODEL'
   if ($model) { return $model.Trim() }
   return $DefaultModel
+}
+
+function Save-Endpoint([string]$Endpoint) {
+  $Endpoint = $Endpoint.Trim()
+  if ([string]::IsNullOrEmpty($Endpoint)) {
+    Write-Host 'Refusing to save an empty endpoint.'
+    return
+  }
+  Set-ConfigValue 'NVIDIACLAUDE_API_ENDPOINT' $Endpoint
+  Write-Host "Endpoint saved to $ConfigFile"
+}
+
+function Get-ConfiguredEndpoint {
+  if ($env:NVIDIACLAUDE_API_ENDPOINT) { return $env:NVIDIACLAUDE_API_ENDPOINT.Trim() }
+  if ($env:NVIDIA_NIM_ENDPOINT) { return $env:NVIDIA_NIM_ENDPOINT.Trim() }
+  $endpoint = Get-ConfigValue 'NVIDIACLAUDE_API_ENDPOINT'
+  if ($endpoint) { return $endpoint.Trim() }
+  $endpoint = Get-ConfigValue 'NVIDIA_NIM_ENDPOINT'
+  if ($endpoint) { return $endpoint.Trim() }
+  return $DefaultEndpoint
 }
 
 function Invoke-Setup {
@@ -212,12 +261,12 @@ function Invoke-Setup {
   Write-Host '|  nvidiaclaude - first-time setup         |'
   Write-Host '+------------------------------------------+'
   Write-Host ''
-  Write-Host 'Claude Code will run against NVIDIA NIM.'
-  Write-Host 'You only need to enter your NVIDIA API key once.'
+  Write-Host 'Claude Code will run against your configured provider.'
+  Write-Host 'You only need to enter your provider API key once.'
   Write-Host 'Additional tokens can be added later with: nvidiaclaude token add'
   Write-Host ''
   for ($i = 0; $i -lt 3; $i++) {
-    $secure = Read-Host -AsSecureString 'NVIDIA API key'
+    $secure = Read-Host -AsSecureString 'Provider API key'
     $bstr   = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
     $key    = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
     [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
@@ -244,7 +293,7 @@ function Invoke-TokenCommand([string[]]$CommandArgs) {
       if ($CommandArgs.Count -ge 3) {
         $key = $CommandArgs[2].Trim()
       } else {
-        $secure = Read-Host -AsSecureString 'NVIDIA API key'
+        $secure = Read-Host -AsSecureString 'Provider API key'
         $bstr   = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
         $key    = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
         [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
@@ -266,7 +315,7 @@ function Invoke-TokenCommand([string[]]$CommandArgs) {
     '^(list|ls)$' {
       $keys = @(Get-ConfigKeys)
       if ($keys.Count -eq 0) {
-        Write-Host 'No stored NVIDIA API tokens.'
+        Write-Host 'No stored provider API tokens.'
       } else {
         for ($i = 0; $i -lt $keys.Count; $i++) {
           Write-Host "$($i + 1). $(Mask-Key $keys[$i])"
@@ -470,12 +519,12 @@ nvidiaclaude command reference
 
 Start
   nvidiaclaude [CLAUDE_ARGS...]
-      Start Claude Code through the local NVIDIA NIM adapter.
+      Start Claude Code through the local OpenAI-compatible adapter.
       Any extra arguments are passed through to the claude CLI.
 
 API key
   nvidiaclaude config <KEY>
-      Replace the stored token list with one NVIDIA API token.
+      Replace the stored token list with one provider API token.
 
   nvidiaclaude change-key [KEY]
       Replace the stored token list. If KEY is omitted, nvidiaclaude asks
@@ -483,7 +532,7 @@ API key
       Aliases: config, set-key, change
 
   nvidiaclaude token add [KEY]
-      Add another NVIDIA API token for automatic failover.
+      Add another provider API token for automatic failover.
 
   nvidiaclaude token list
       List saved tokens with masked values.
@@ -492,14 +541,14 @@ API key
       Remove one saved token by index from token list.
 
   nvidiaclaude token clear
-      Remove all saved tokens. The stored model is kept.
+      Remove all saved tokens. Stored model and endpoint are kept.
 
   nvidiaclaude reset
-      Remove all saved tokens. The stored model is kept.
+      Remove all saved tokens. Stored model and endpoint are kept.
 
 Model
   nvidiaclaude change-model <MODEL>
-      Save the NVIDIA NIM model used by future nvidiaclaude runs.
+      Save the provider model used by future nvidiaclaude runs.
 
   nvidiaclaude set-model <MODEL>
       Alias for change-model.
@@ -511,6 +560,21 @@ Model
   nvidiaclaude reset-model
       Remove the stored model and return to the default model:
       $DefaultModel
+
+Endpoint
+  nvidiaclaude change-endpoint <URL>
+      Save the provider endpoint used by future nvidiaclaude runs.
+
+  nvidiaclaude set-endpoint <URL>
+      Alias for change-endpoint.
+
+  nvidiaclaude endpoint
+      Show the endpoint new runs will use after applying env/config/default
+      precedence.
+
+  nvidiaclaude reset-endpoint
+      Remove the stored endpoint and return to the default endpoint:
+      $DefaultEndpoint
 
 Maintenance
   nvidiaclaude update
@@ -526,29 +590,41 @@ Maintenance
       Aliases: help, --help-nvidiaclaude
 
 Environment overrides
-  NVIDIA_API_KEY
+  NVIDIACLAUDE_API_KEY
       Use this token if no token is stored yet. It will be saved for next time.
 
-  NVIDIA_API_KEYS
+  NVIDIACLAUDE_API_KEYS
       Comma-separated token list if no token is stored yet. It will be saved
       for next time.
 
-  NVIDIA_NIM_MODEL
+  NVIDIA_API_KEY
+      Legacy alias for NVIDIACLAUDE_API_KEY.
+
+  NVIDIA_API_KEYS
+      Legacy alias for NVIDIACLAUDE_API_KEYS.
+
+  NVIDIACLAUDE_MODEL
       Override the configured model for one run.
 
-  NVIDIA_NIM_ENDPOINT
-      Override the NVIDIA NIM endpoint for one run.
+  NVIDIA_NIM_MODEL
+      Legacy alias for NVIDIACLAUDE_MODEL.
+
+  NVIDIACLAUDE_API_ENDPOINT
+      Override the configured provider endpoint for one run.
       Default: $DefaultEndpoint
 
+  NVIDIA_NIM_ENDPOINT
+      Legacy alias for NVIDIACLAUDE_API_ENDPOINT.
+
   NVIDIACLAUDE_STREAM_PING_SECONDS
-      Send Anthropic SSE ping events while waiting for NVIDIA NIM stream
+      Send Anthropic SSE ping events while waiting for provider stream
       chunks. Default: 2. Set to 0 to disable.
 
   NVIDIACLAUDE_TOKEN_COOLDOWN_SECONDS
       Seconds to avoid a token after a token-specific failure. Default: 60.
 
   NVIDIACLAUDE_RATE_LIMIT_RPM
-      Maximum NVIDIA requests per shared rate-limit window. Default: 38.
+      Maximum provider requests per shared rate-limit window. Default: 38.
       Set to 0 to disable proactive throttling.
 
   NVIDIACLAUDE_RATE_LIMIT_SCOPE
@@ -601,8 +677,28 @@ if ($args.Count -ge 1) {
       exit 0
     }
     '^(reset-model|--reset-model)$' {
+      Remove-ConfigValue 'NVIDIACLAUDE_MODEL'
       Remove-ConfigValue 'NVIDIA_NIM_MODEL'
       Write-Host "Stored model removed. New runs will use default model: $DefaultModel"
+      exit 0
+    }
+    '^(change-endpoint|--change-endpoint|set-endpoint|--set-endpoint)$' {
+      if ($args.Count -lt 2) {
+        Write-Host 'Usage: nvidiaclaude change-endpoint <URL>'
+        exit 1
+      }
+      Save-Endpoint $args[1]
+      Write-Host "Done. New runs will use endpoint: $(Get-ConfiguredEndpoint)"
+      exit 0
+    }
+    '^(endpoint|--endpoint|current-endpoint|--current-endpoint)$' {
+      Write-Host (Get-ConfiguredEndpoint)
+      exit 0
+    }
+    '^(reset-endpoint|--reset-endpoint)$' {
+      Remove-ConfigValue 'NVIDIACLAUDE_API_ENDPOINT'
+      Remove-ConfigValue 'NVIDIA_NIM_ENDPOINT'
+      Write-Host "Stored endpoint removed. New runs will use default endpoint: $DefaultEndpoint"
       exit 0
     }
     '^(reset|--reset)$' {
@@ -629,7 +725,7 @@ $keys = @(Get-ConfigKeys)
 if ($keys.Count -eq 0) {
   $keys = @(Get-EnvKeys)
   if ($keys.Count -gt 0) {
-    Write-Host 'Using NVIDIA API token(s) from environment; saving for next time.'
+    Write-Host 'Using provider API token(s) from environment; saving for next time.'
     Save-Keys $keys | Out-Null
   }
 }
@@ -650,10 +746,14 @@ if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
   exit 127
 }
 
-$env:NVIDIA_API_KEY = $keys[0]
-$env:NVIDIA_API_KEYS = ($keys -join ',')
-if (-not $env:NVIDIA_NIM_ENDPOINT) { $env:NVIDIA_NIM_ENDPOINT = $DefaultEndpoint }
-$env:NVIDIA_NIM_MODEL = Get-ConfiguredModel
+$env:NVIDIACLAUDE_API_KEY = $keys[0]
+$env:NVIDIACLAUDE_API_KEYS = ($keys -join ',')
+$env:NVIDIA_API_KEY = $env:NVIDIACLAUDE_API_KEY
+$env:NVIDIA_API_KEYS = $env:NVIDIACLAUDE_API_KEYS
+$env:NVIDIACLAUDE_API_ENDPOINT = Get-ConfiguredEndpoint
+$env:NVIDIA_NIM_ENDPOINT = $env:NVIDIACLAUDE_API_ENDPOINT
+$env:NVIDIACLAUDE_MODEL = Get-ConfiguredModel
+$env:NVIDIA_NIM_MODEL = $env:NVIDIACLAUDE_MODEL
 
 $proxy = $null
 $exitCode = 1
