@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import os
 import queue
 import sys
@@ -37,10 +38,13 @@ def make_config(
     rate_limit_rpm=38.0,
     rate_limit_scope="global",
     rate_limit_window_seconds=60.0,
+    rate_limit_mode="wait",
+    provider_mode="openai",
+    endpoint="https://example.test/v1/chat/completions",
 ):
     cooldown = 60.0
     return proxy.ProxyConfig(
-        endpoint="https://example.test/v1/chat/completions",
+        endpoint=endpoint,
         api_keys=list(keys),
         model="test-model",
         timeout=1.0,
@@ -55,7 +59,10 @@ def make_config(
             rate_limit_rpm,
             rate_limit_scope,
             rate_limit_window_seconds,
+            rate_limit_mode,
         ),
+        provider_mode=provider_mode,
+        rate_limit_mode=rate_limit_mode,
     )
 
 
@@ -75,6 +82,41 @@ class FailoverTests(unittest.TestCase):
         self.assertEqual(
             proxy.normalize_endpoint("https://api.tokenrouter.com"),
             "https://api.tokenrouter.com/v1/chat/completions",
+        )
+
+    def test_normalize_anthropic_endpoint_accepts_messages_url(self):
+        endpoint = "https://api.anthropic.com/v1/messages"
+
+        self.assertEqual(proxy.normalize_anthropic_endpoint(endpoint), endpoint)
+
+    def test_normalize_anthropic_endpoint_appends_messages_to_v1_base(self):
+        self.assertEqual(
+            proxy.normalize_anthropic_endpoint("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com/v1/messages",
+        )
+
+    def test_resolve_provider_mode_detects_anthropic_first_party_endpoint(self):
+        self.assertEqual(
+            proxy.resolve_provider_mode("auto", "https://api.anthropic.com/v1"),
+            "anthropic",
+        )
+
+    def test_resolve_provider_mode_detects_messages_path(self):
+        self.assertEqual(
+            proxy.resolve_provider_mode("auto", "https://gateway.example/v1/messages"),
+            "anthropic",
+        )
+
+    def test_resolve_provider_mode_defaults_to_openai_for_generic_endpoint(self):
+        self.assertEqual(
+            proxy.resolve_provider_mode("auto", "https://api.tokenrouter.com/v1"),
+            "openai",
+        )
+
+    def test_resolve_provider_mode_manual_override_wins(self):
+        self.assertEqual(
+            proxy.resolve_provider_mode("openai", "https://api.anthropic.com/v1"),
+            "openai",
         )
 
     def test_load_api_keys_prefers_generic_env_over_legacy_env(self):
@@ -109,6 +151,56 @@ class FailoverTests(unittest.TestCase):
 
     def test_split_api_keys_trims_and_deduplicates(self):
         self.assertEqual(proxy.split_api_keys(" a, b ,,a , c "), ["a", "b", "c"])
+
+    def test_load_api_keys_accepts_anthropic_api_key_fallback(self):
+        env = {"ANTHROPIC_API_KEY": " anthropic-key "}
+
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(proxy.load_api_keys_from_env(), ["anthropic-key"])
+
+    def test_anthropic_provider_request_uses_native_headers_and_payload(self):
+        config = make_config(
+            keys=("anthropic-key",),
+            provider_mode="anthropic",
+            endpoint="https://api.anthropic.com/v1/messages",
+        )
+        payload = {
+            "model": "test-model",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": False,
+        }
+
+        with patch.object(proxy.urllib.request, "urlopen", return_value=DummyResponse()) as urlopen:
+            proxy.provider_request(
+                config,
+                payload,
+                0,
+                {"Anthropic-Beta": "tools-2024-04-04"},
+            )
+
+        request = urlopen.call_args.args[0]
+        headers = {key.lower(): value for key, value in request.header_items()}
+        self.assertEqual(request.full_url, "https://api.anthropic.com/v1/messages")
+        self.assertEqual(headers["x-api-key"], "anthropic-key")
+        self.assertEqual(headers["anthropic-version"], proxy.DEFAULT_ANTHROPIC_VERSION)
+        self.assertEqual(headers["anthropic-beta"], "tools-2024-04-04")
+        self.assertNotIn("authorization", headers)
+        self.assertEqual(json.loads(request.data.decode("utf-8")), payload)
+
+    def test_build_anthropic_payload_overrides_model_from_config(self):
+        config = make_config(provider_mode="anthropic")
+
+        payload = proxy.build_anthropic_payload(
+            {
+                "model": "claude-code-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            config,
+        )
+
+        self.assertEqual(payload["model"], "test-model")
+        self.assertFalse(payload["stream"])
 
     def test_provider_request_with_failover_retries_next_token_for_auth_failure(self):
         config = make_config()
@@ -284,6 +376,52 @@ class FailoverTests(unittest.TestCase):
         self.assertEqual(manager.acquire_token(), 0)
         self.assertEqual(manager.rate_wait_seconds(0, time.time()), 0.0)
         self.assertEqual(manager.acquire_token(), 0)
+
+    def test_token_manager_rate_limit_off_mode_disables_throttling(self):
+        manager = proxy.TokenManager(
+            token_count=1,
+            cooldown_seconds=60.0,
+            rate_limit_rpm=1.0,
+            rate_limit_scope="global",
+            rate_limit_window_seconds=60.0,
+            rate_limit_mode="off",
+        )
+
+        self.assertEqual(manager.acquire_token(), 0)
+        self.assertEqual(manager.rate_wait_seconds(0, time.time()), 0.0)
+        self.assertEqual(manager.acquire_token(), 0)
+
+    def test_token_manager_fail_fast_mode_returns_none_when_rate_bucket_is_full(self):
+        manager = proxy.TokenManager(
+            token_count=1,
+            cooldown_seconds=60.0,
+            rate_limit_rpm=1.0,
+            rate_limit_scope="global",
+            rate_limit_window_seconds=60.0,
+            rate_limit_mode="fail-fast",
+        )
+
+        self.assertEqual(manager.acquire_token(), 0)
+        self.assertIsNone(manager.acquire_token())
+        self.assertGreater(manager.next_rate_wait() or 0, 0)
+
+    def test_provider_request_with_failover_fail_fast_rate_limit_does_not_call_provider(self):
+        config = make_config(
+            keys=("token-a",),
+            rate_limit_rpm=1.0,
+            rate_limit_scope="global",
+            rate_limit_window_seconds=60.0,
+            rate_limit_mode="fail-fast",
+        )
+        self.assertEqual(config.token_manager.acquire_token(), 0)
+
+        with patch.object(proxy, "provider_request") as provider_request:
+            with self.assertRaises(proxy.ProviderError) as raised:
+                proxy.provider_request_with_failover(config, {"stream": False})
+
+        provider_request.assert_not_called()
+        self.assertEqual(raised.exception.status, 429)
+        self.assertIn("Local provider request rate limit is full", raised.exception.message)
 
     def test_token_manager_returns_none_when_every_available_token_is_cooling(self):
         manager = proxy.TokenManager(

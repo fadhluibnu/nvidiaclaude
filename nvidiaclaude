@@ -8,7 +8,8 @@
 #   3. NVIDIACLAUDE_API_KEY env var  - single key, saved for next time
 #   4. NVIDIA_API_KEYS env var       - legacy comma-separated keys, saved for next time
 #   5. NVIDIA_API_KEY env var        - legacy single key, saved for next time
-#   6. interactive prompt            - asks for a key if needed
+#   6. ANTHROPIC_API_KEY env var     - Anthropic-compatible single key
+#   7. interactive prompt            - asks for a key if needed
 #
 set -euo pipefail
 
@@ -16,6 +17,11 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nvidiaclaude"
 CONFIG_FILE="$CONFIG_DIR/config"
 DEFAULT_ENDPOINT="https://integrate.api.nvidia.com/v1/chat/completions"
 DEFAULT_MODEL="minimaxai/minimax-m3"
+DEFAULT_PROVIDER_MODE="auto"
+DEFAULT_RATE_LIMIT_MODE="wait"
+DEFAULT_RATE_LIMIT_RPM="38"
+DEFAULT_RATE_LIMIT_SCOPE="global"
+DEFAULT_RATE_LIMIT_WINDOW_SECONDS="60"
 LOCAL_AUTH_TOKEN="nvidiaclaude-local"
 DEFAULT_INSTALL_REF="main"
 
@@ -140,6 +146,8 @@ load_env_keys() {
     done < <(parse_key_csv "$NVIDIA_API_KEYS")
   elif [ -n "${NVIDIA_API_KEY:-}" ]; then
     add_unique_token "$NVIDIA_API_KEY"
+  elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    add_unique_token "$ANTHROPIC_API_KEY"
   fi
 }
 
@@ -303,6 +311,124 @@ configured_endpoint() {
   else
     printf '%s' "$DEFAULT_ENDPOINT"
   fi
+}
+
+normalize_provider_mode() {
+  local mode
+  mode="$(trim "$1")"
+  mode="${mode,,}"
+  case "$mode" in
+    openai|openai-compatible|chat-completions|chat_completions) printf '%s' "openai" ;;
+    anthropic|anthropic-native|messages|claude) printf '%s' "anthropic" ;;
+    auto|"") printf '%s' "auto" ;;
+    *) return 1 ;;
+  esac
+}
+
+save_provider_mode() {
+  local mode
+  if ! mode="$(normalize_provider_mode "$1")"; then
+    say "Provider mode must be one of: auto, openai, anthropic."
+    return 1
+  fi
+  set_config_value NVIDIACLAUDE_PROVIDER_MODE "$mode"
+  say "Provider mode saved to $CONFIG_FILE"
+}
+
+configured_provider_mode() {
+  local mode
+  mode="$(read_config_value NVIDIACLAUDE_PROVIDER_MODE)"
+  if [ -n "${NVIDIACLAUDE_PROVIDER_MODE:-}" ]; then
+    normalize_provider_mode "$NVIDIACLAUDE_PROVIDER_MODE" || printf '%s' "$DEFAULT_PROVIDER_MODE"
+  elif [ -n "$mode" ]; then
+    normalize_provider_mode "$mode" || printf '%s' "$DEFAULT_PROVIDER_MODE"
+  else
+    printf '%s' "$DEFAULT_PROVIDER_MODE"
+  fi
+}
+
+normalize_rate_limit_mode() {
+  local mode
+  mode="$(trim "$1")"
+  mode="${mode,,}"
+  mode="${mode//_/-}"
+  case "$mode" in
+    wait|"") printf '%s' "wait" ;;
+    fail-fast|failfast|fast-fail|reject|reject-local) printf '%s' "fail-fast" ;;
+    off|disable|disabled|none|no|0) printf '%s' "off" ;;
+    *) return 1 ;;
+  esac
+}
+
+is_nonnegative_number() {
+  [[ "$1" =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)$ ]]
+}
+
+configured_rate_limit_mode() {
+  local mode
+  mode="$(read_config_value NVIDIACLAUDE_RATE_LIMIT_MODE)"
+  if [ -n "${NVIDIACLAUDE_RATE_LIMIT_MODE:-}" ]; then
+    normalize_rate_limit_mode "$NVIDIACLAUDE_RATE_LIMIT_MODE" || printf '%s' "$DEFAULT_RATE_LIMIT_MODE"
+  elif [ -n "$mode" ]; then
+    normalize_rate_limit_mode "$mode" || printf '%s' "$DEFAULT_RATE_LIMIT_MODE"
+  else
+    printf '%s' "$DEFAULT_RATE_LIMIT_MODE"
+  fi
+}
+
+configured_rate_limit_rpm() {
+  local rpm
+  rpm="$(read_config_value NVIDIACLAUDE_RATE_LIMIT_RPM)"
+  if [ -n "${NVIDIACLAUDE_RATE_LIMIT_RPM:-}" ]; then
+    printf '%s' "$(trim "$NVIDIACLAUDE_RATE_LIMIT_RPM")"
+  elif [ -n "$rpm" ]; then
+    printf '%s' "$(trim "$rpm")"
+  else
+    printf '%s' "$DEFAULT_RATE_LIMIT_RPM"
+  fi
+}
+
+configured_rate_limit_scope() {
+  if [ -n "${NVIDIACLAUDE_RATE_LIMIT_SCOPE:-}" ]; then
+    printf '%s' "$(trim "$NVIDIACLAUDE_RATE_LIMIT_SCOPE")"
+  else
+    printf '%s' "$DEFAULT_RATE_LIMIT_SCOPE"
+  fi
+}
+
+configured_rate_limit_window_seconds() {
+  if [ -n "${NVIDIACLAUDE_RATE_LIMIT_WINDOW_SECONDS:-}" ]; then
+    printf '%s' "$(trim "$NVIDIACLAUDE_RATE_LIMIT_WINDOW_SECONDS")"
+  else
+    printf '%s' "$DEFAULT_RATE_LIMIT_WINDOW_SECONDS"
+  fi
+}
+
+save_rate_limit_mode() {
+  local mode="$1" rpm="${2:-}"
+  if ! mode="$(normalize_rate_limit_mode "$mode")"; then
+    say "Rate-limit mode must be one of: wait, fail-fast, off."
+    return 1
+  fi
+  if [ -n "$rpm" ]; then
+    rpm="$(trim "$rpm")"
+    if ! is_nonnegative_number "$rpm"; then
+      say "RPM must be a non-negative number."
+      return 1
+    fi
+  fi
+  set_config_value NVIDIACLAUDE_RATE_LIMIT_MODE "$mode"
+  if [ -n "$rpm" ]; then
+    set_config_value NVIDIACLAUDE_RATE_LIMIT_RPM "$rpm"
+  fi
+  say "Rate-limit mode saved to $CONFIG_FILE"
+}
+
+show_rate_limit_status() {
+  printf 'mode=%s\n' "$(configured_rate_limit_mode)"
+  printf 'rpm=%s\n' "$(configured_rate_limit_rpm)"
+  printf 'scope=%s\n' "$(configured_rate_limit_scope)"
+  printf 'window_seconds=%s\n' "$(configured_rate_limit_window_seconds)"
 }
 
 read_secret() {
@@ -507,6 +633,33 @@ Endpoint
       Remove the stored endpoint and return to the default endpoint:
       $DEFAULT_ENDPOINT
 
+Provider mode
+  nvidiaclaude provider-mode
+      Show provider mode new runs will use: auto, openai, or anthropic.
+
+  nvidiaclaude provider-mode <auto|openai|anthropic>
+      Save provider mode. auto detects Anthropic-native endpoints and uses
+      OpenAI-compatible conversion for other endpoints.
+
+  nvidiaclaude reset-provider-mode
+      Remove the stored provider mode and return to auto.
+
+Rate limit
+  nvidiaclaude rate-limit status
+      Show local proactive rate-limit settings.
+
+  nvidiaclaude rate-limit wait [RPM]
+      Wait silently when the local RPM bucket is full. This is the default.
+
+  nvidiaclaude rate-limit fail-fast [RPM]
+      Return a local 429 instead of pending when the local RPM bucket is full.
+
+  nvidiaclaude rate-limit off
+      Disable local proactive throttling. Provider 429s may still happen.
+
+  nvidiaclaude rate-limit reset
+      Return to default wait mode and default RPM.
+
 Maintenance
   nvidiaclaude update
       Re-run the installer from the selected install branch.
@@ -534,6 +687,10 @@ Environment overrides
   NVIDIA_API_KEYS
       Legacy alias for NVIDIACLAUDE_API_KEYS.
 
+  ANTHROPIC_API_KEY
+      Anthropic-compatible single-token fallback if no nvidiaclaude or legacy
+      NVIDIA token is configured.
+
   NVIDIACLAUDE_MODEL
       Override the configured model for one run.
 
@@ -547,6 +704,9 @@ Environment overrides
   NVIDIA_NIM_ENDPOINT
       Legacy alias for NVIDIACLAUDE_API_ENDPOINT.
 
+  NVIDIACLAUDE_PROVIDER_MODE
+      Provider mode: auto, openai, or anthropic. Default: auto.
+
   NVIDIACLAUDE_STREAM_PING_SECONDS
       Send Anthropic SSE ping events while waiting for provider stream
       chunks. Default: 2. Set to 0 to disable.
@@ -558,6 +718,10 @@ Environment overrides
   NVIDIACLAUDE_RATE_LIMIT_RPM
       Maximum provider requests per shared rate-limit window. Default: 38.
       Set to 0 to disable proactive throttling.
+
+  NVIDIACLAUDE_RATE_LIMIT_MODE
+      Local proactive rate-limit behavior: wait, fail-fast, or off.
+      Default: wait.
 
   NVIDIACLAUDE_RATE_LIMIT_SCOPE
       Rate-limit scope: global or per-token. Default: global.
@@ -755,6 +919,51 @@ case "${1:-}" in
     say "Stored endpoint removed. New runs will use default endpoint: $DEFAULT_ENDPOINT"
     exit 0
     ;;
+  provider-mode|--provider-mode)
+    if [ "${2:-}" = "" ]; then
+      printf '%s\n' "$(configured_provider_mode)"
+    else
+      save_provider_mode "$2"
+      say "Done. New runs will use provider mode: $(configured_provider_mode)"
+    fi
+    exit 0
+    ;;
+  reset-provider-mode|--reset-provider-mode)
+    remove_config_value NVIDIACLAUDE_PROVIDER_MODE
+    say "Stored provider mode removed. New runs will use provider mode: $DEFAULT_PROVIDER_MODE"
+    exit 0
+    ;;
+  rate-limit|--rate-limit)
+    action="${2:-status}"
+    case "$action" in
+      status|"")
+        show_rate_limit_status
+        ;;
+      wait|fail-fast|failfast|fast-fail|reject|reject-local|off|disable|disabled|none|no|0)
+        save_rate_limit_mode "$action" "${3:-}"
+        say "Done. New runs will use rate-limit mode: $(configured_rate_limit_mode)"
+        ;;
+      reset)
+        remove_config_value NVIDIACLAUDE_RATE_LIMIT_MODE
+        remove_config_value NVIDIACLAUDE_RATE_LIMIT_RPM
+        say "Stored rate-limit settings removed. New runs will use $DEFAULT_RATE_LIMIT_MODE $DEFAULT_RATE_LIMIT_RPM RPM."
+        ;;
+      help|--help|-h)
+        say "Usage:"
+        say "  nvidiaclaude rate-limit status"
+        say "  nvidiaclaude rate-limit wait [RPM]"
+        say "  nvidiaclaude rate-limit fail-fast [RPM]"
+        say "  nvidiaclaude rate-limit off"
+        say "  nvidiaclaude rate-limit reset"
+        ;;
+      *)
+        say "Unknown rate-limit command: $action"
+        say "Run 'nvidiaclaude rate-limit help' for usage."
+        exit 1
+        ;;
+    esac
+    exit 0
+    ;;
   reset|--reset)
     remove_all_keys
     say "All stored tokens removed."
@@ -808,6 +1017,9 @@ export NVIDIACLAUDE_API_ENDPOINT="$(configured_endpoint)"
 export NVIDIA_NIM_ENDPOINT="$NVIDIACLAUDE_API_ENDPOINT"
 export NVIDIACLAUDE_MODEL="$(configured_model)"
 export NVIDIA_NIM_MODEL="$NVIDIACLAUDE_MODEL"
+export NVIDIACLAUDE_PROVIDER_MODE="$(configured_provider_mode)"
+export NVIDIACLAUDE_RATE_LIMIT_MODE="$(configured_rate_limit_mode)"
+export NVIDIACLAUDE_RATE_LIMIT_RPM="$(configured_rate_limit_rpm)"
 
 trap cleanup_proxy EXIT INT TERM
 PORT="$(start_proxy)"

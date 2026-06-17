@@ -1,15 +1,22 @@
 # nvidiaclaude
 
 Run [Claude Code](https://docs.claude.com/en/docs/claude-code) against
-OpenAI Chat Completions-compatible providers through a local
-Anthropic-compatible adapter.
+OpenAI Chat Completions-compatible providers or Anthropic Messages-compatible
+providers through a local Anthropic-compatible adapter.
 
 Install once, add one or more provider API tokens, and then run
 `nvidiaclaude`. The command starts a local proxy, points Claude Code at it, and
 forwards requests to the configured provider. NVIDIA NIM remains the default
-provider endpoint.
+provider endpoint, while Anthropic-native endpoints are supported through
+provider mode `auto` or `anthropic`.
 
 > Requires the `claude` CLI and Python 3 to already be installed.
+
+Full documentation lives in [`docs/`](docs/README.md):
+
+- [Project manual](docs/README.md)
+- [Provider guide](docs/providers.md)
+- [Rate limit guide](docs/rate-limits.md)
 
 ## Install
 
@@ -80,8 +87,8 @@ nvidiaclaude commands
 nvidiaclaude [CLAUDE_ARGS...]
 ```
 
-Starts Claude Code through the local OpenAI-compatible adapter. Extra
-arguments pass through to the `claude` CLI.
+Starts Claude Code through the local provider adapter. Extra arguments pass
+through to the `claude` CLI.
 
 ### API Key
 
@@ -119,11 +126,32 @@ nvidiaclaude change-endpoint <URL>
 nvidiaclaude set-endpoint <URL>
 nvidiaclaude endpoint
 nvidiaclaude reset-endpoint
+nvidiaclaude provider-mode
+nvidiaclaude provider-mode <auto|openai|anthropic>
+nvidiaclaude reset-provider-mode
 ```
 
 Use `change-endpoint` or `set-endpoint` to persist a provider endpoint. Use
 `endpoint` to show the endpoint new runs will use. Use `reset-endpoint` to
 return to the default NVIDIA endpoint.
+
+Use `provider-mode` to show or persist how the proxy talks to the upstream
+provider. `auto` detects Anthropic-native endpoints and otherwise uses
+OpenAI-compatible conversion.
+
+### Rate Limit
+
+```bash
+nvidiaclaude rate-limit status
+nvidiaclaude rate-limit wait [RPM]
+nvidiaclaude rate-limit fail-fast [RPM]
+nvidiaclaude rate-limit off
+nvidiaclaude rate-limit reset
+```
+
+`wait` preserves the original silent pending behavior. `fail-fast` returns a
+local 429 instead of pending when the local RPM bucket is full. `off` disables
+local proactive throttling.
 
 ### Maintenance
 
@@ -143,14 +171,17 @@ for `commands`: `help`, `--help-nvidiaclaude`.
 ```bash
 NVIDIACLAUDE_API_KEY=<KEY> nvidiaclaude
 NVIDIACLAUDE_API_KEYS=<KEY1>,<KEY2> nvidiaclaude
+ANTHROPIC_API_KEY=<KEY> nvidiaclaude
 NVIDIACLAUDE_MODEL=<MODEL> nvidiaclaude
 NVIDIACLAUDE_API_ENDPOINT=<URL> nvidiaclaude
+NVIDIACLAUDE_PROVIDER_MODE=auto nvidiaclaude
 NVIDIA_API_KEY=<KEY> nvidiaclaude
 NVIDIA_API_KEYS=<KEY1>,<KEY2> nvidiaclaude
 NVIDIA_NIM_MODEL=<MODEL> nvidiaclaude
 NVIDIA_NIM_ENDPOINT=<URL> nvidiaclaude
 NVIDIACLAUDE_STREAM_PING_SECONDS=<SECONDS> nvidiaclaude
 NVIDIACLAUDE_TOKEN_COOLDOWN_SECONDS=<SECONDS> nvidiaclaude
+NVIDIACLAUDE_RATE_LIMIT_MODE=fail-fast nvidiaclaude
 NVIDIACLAUDE_RATE_LIMIT_RPM=<RPM> nvidiaclaude
 NVIDIACLAUDE_RATE_LIMIT_SCOPE=global nvidiaclaude
 NVIDIACLAUDE_RATE_LIMIT_WINDOW_SECONDS=<SECONDS> nvidiaclaude
@@ -160,14 +191,17 @@ NVIDIACLAUDE_BIN_DIR=<DIR> ./install.sh
 
 `NVIDIACLAUDE_API_KEY` or `NVIDIACLAUDE_API_KEYS` is saved for next time if no
 token is stored yet. `NVIDIA_API_KEY` and `NVIDIA_API_KEYS` are legacy aliases.
+`ANTHROPIC_API_KEY` is a single-token fallback for Anthropic-compatible usage.
 `NVIDIACLAUDE_MODEL` and `NVIDIACLAUDE_API_ENDPOINT` override config for one
-run. `NVIDIA_NIM_MODEL` and `NVIDIA_NIM_ENDPOINT` are legacy aliases.
+run. `NVIDIACLAUDE_PROVIDER_MODE` can be `auto`, `openai`, or `anthropic`.
+`NVIDIA_NIM_MODEL` and `NVIDIA_NIM_ENDPOINT` are legacy aliases.
 `NVIDIACLAUDE_STREAM_PING_SECONDS` controls stream heartbeat pings while
 waiting for provider chunks. Set it to `0` to disable pings.
 `NVIDIACLAUDE_TOKEN_COOLDOWN_SECONDS` controls how long a failed token is
 avoided after token auth, quota, or rate-limit errors. Default: `60`.
-`NVIDIACLAUDE_RATE_LIMIT_RPM` proactively throttles provider requests. Default:
-`38`; set it to `0` to disable proactive throttling.
+`NVIDIACLAUDE_RATE_LIMIT_MODE` controls local proactive throttling behavior:
+`wait`, `fail-fast`, or `off`. Default: `wait`.
+`NVIDIACLAUDE_RATE_LIMIT_RPM` sets the local RPM threshold. Default: `38`.
 `NVIDIACLAUDE_RATE_LIMIT_SCOPE` can be `global` or `per-token`. Default:
 `global`.
 `NVIDIACLAUDE_RATE_LIMIT_WINDOW_SECONDS` controls the RPM window length.
@@ -191,7 +225,8 @@ Tokens are resolved in this order:
 3. `NVIDIACLAUDE_API_KEY` environment variable.
 4. `NVIDIA_API_KEYS` environment variable, comma-separated legacy alias.
 5. `NVIDIA_API_KEY` environment variable, legacy alias.
-6. Interactive prompt - asked for automatically if none of the above is set.
+6. `ANTHROPIC_API_KEY` environment variable, Anthropic-compatible fallback.
+7. Interactive prompt - asked for automatically if none of the above is set.
 
 ## Manage Your Tokens
 
@@ -223,11 +258,12 @@ immediately tries the next ready token. If every configured token is cooling
 down after provider rate-limit responses, the request fails with a clear error
 so Claude Code can stop instead of waiting for a long internal retry loop.
 
-The proxy also has a silent proactive RPM throttle to avoid hitting provider
-request-per-minute limits. When the shared RPM bucket is full, the proxy waits
-internally without printing rate-limit noise to your terminal. Use
-`NVIDIACLAUDE_RATE_LIMIT_SCOPE=per-token` only when your tokens are known to
-have separate RPM buckets.
+The proxy also has a proactive RPM limiter to avoid hitting provider
+request-per-minute limits. Default mode `wait` silently waits when the bucket is
+full. Use `rate-limit fail-fast` to return a local 429 instead of pending, or
+`rate-limit off` to disable local proactive throttling. Use
+`NVIDIACLAUDE_RATE_LIMIT_SCOPE=per-token` only when your tokens are known to have
+separate RPM buckets.
 
 For streaming responses, failover is safe before content output starts. If a
 token fails after partial streaming output, the proxy returns an SSE error for
@@ -293,6 +329,7 @@ By default, `nvidiaclaude` uses:
 
 ```sh
 NVIDIACLAUDE_API_ENDPOINT="https://integrate.api.nvidia.com/v1/chat/completions"
+NVIDIACLAUDE_PROVIDER_MODE="auto"
 NVIDIACLAUDE_MODEL="minimaxai/minimax-m3"
 ```
 
@@ -309,25 +346,47 @@ Show the endpoint that new runs will use:
 nvidiaclaude endpoint
 ```
 
-Return to the default NVIDIA endpoint:
+Show or change the provider mode:
+
+```bash
+nvidiaclaude provider-mode
+nvidiaclaude provider-mode auto
+nvidiaclaude provider-mode openai
+nvidiaclaude provider-mode anthropic
+```
+
+Return to the default NVIDIA endpoint and auto provider mode:
 
 ```bash
 nvidiaclaude reset-endpoint
+nvidiaclaude reset-provider-mode
 ```
 
-The endpoint can be either a provider base URL ending in `/v1` or the full Chat
-Completions URL. These two TokenRouter values are equivalent:
+For OpenAI-compatible providers, the endpoint can be either a provider base URL
+ending in `/v1` or the full Chat Completions URL. These two TokenRouter values
+are equivalent:
 
 ```bash
 https://api.tokenrouter.com/v1
 https://api.tokenrouter.com/v1/chat/completions
 ```
 
-Internally, `nvidiaclaude` sends requests to `/chat/completions`. If you provide
-`https://api.tokenrouter.com/v1`, it is normalized to
+In OpenAI mode, `nvidiaclaude` sends requests to `/chat/completions`. If you
+provide `https://api.tokenrouter.com/v1`, it is normalized to
 `https://api.tokenrouter.com/v1/chat/completions`. For normal use, prefer the
 shorter `/v1` form; use the full URL when a provider documents a custom Chat
 Completions path.
+
+For Anthropic-compatible providers, use mode `auto` with a clearly Anthropic URL
+or force `anthropic` mode:
+
+```bash
+nvidiaclaude change-endpoint https://api.anthropic.com/v1
+nvidiaclaude provider-mode anthropic
+```
+
+In Anthropic mode, root or `/v1` endpoints are normalized to `/v1/messages`, and
+the upstream request is sent with `x-api-key` plus `anthropic-version`.
 
 You can override endpoint or model for a single run:
 
@@ -355,6 +414,7 @@ The endpoint is resolved in this order:
 
 ```bash
 nvidiaclaude change-endpoint https://api.tokenrouter.com/v1
+nvidiaclaude provider-mode openai
 nvidiaclaude change-model <TOKENROUTER_MODEL>
 nvidiaclaude token add <TOKENROUTER_API_KEY>
 nvidiaclaude
@@ -362,6 +422,19 @@ nvidiaclaude
 
 Use the model name exactly as TokenRouter documents it. TokenRouter must expose
 an OpenAI-compatible Chat Completions API for the selected model.
+
+### Anthropic API Example
+
+```bash
+nvidiaclaude change-endpoint https://api.anthropic.com/v1
+nvidiaclaude provider-mode anthropic
+nvidiaclaude change-model <ANTHROPIC_MODEL>
+nvidiaclaude token add <ANTHROPIC_API_KEY>
+nvidiaclaude
+```
+
+See [Provider guide](docs/providers.md) for details about auto detection and
+manual provider mode overrides.
 
 ## Streaming Heartbeat
 

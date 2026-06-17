@@ -23,6 +23,7 @@ from typing import Any
 
 DEFAULT_ENDPOINT = "https://integrate.api.nvidia.com/v1/chat/completions"
 DEFAULT_MODEL = "minimaxai/minimax-m3"
+DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,9 @@ class ProxyConfig:
     rate_limit_scope: str
     rate_limit_window_seconds: float
     token_manager: "TokenManager"
+    provider_mode: str = "openai"
+    rate_limit_mode: str = "wait"
+    anthropic_version: str = DEFAULT_ANTHROPIC_VERSION
 
 
 def parse_retry_after(value: str | None) -> float | None:
@@ -93,10 +97,14 @@ class TokenManager:
         rate_limit_rpm: float = 38.0,
         rate_limit_scope: str = "global",
         rate_limit_window_seconds: float = 60.0,
+        rate_limit_mode: str = "wait",
     ):
         self.token_count = token_count
         self.cooldown_seconds = cooldown_seconds
+        self.rate_limit_mode = normalize_rate_limit_mode(rate_limit_mode)
         self.rate_limit_count = max(0, int(rate_limit_rpm))
+        if self.rate_limit_mode == "off":
+            self.rate_limit_count = 0
         self.rate_limit_scope = "per-token" if rate_limit_scope == "per-token" else "global"
         self.rate_limit_window_seconds = max(0.001, rate_limit_window_seconds)
         self.active_index = 0
@@ -119,7 +127,7 @@ class TokenManager:
             request_times.popleft()
 
     def rate_wait_seconds(self, index: int, now: float) -> float:
-        if self.rate_limit_count <= 0:
+        if self.rate_limit_mode == "off" or self.rate_limit_count <= 0:
             return 0.0
         self.prune_rate_window(index, now)
         request_times = self.request_times[self.rate_bucket_index(index)]
@@ -176,9 +184,13 @@ class TokenManager:
                     self.reserve_rate_slot(index, now)
                     self.active_index = index
                     return index
+                if reason == "rate":
+                    if self.rate_limit_mode == "fail-fast":
+                        return None
+                    self.condition.wait(wait_seconds)
+                    continue
                 if reason != "rate":
                     return None
-                self.condition.wait(wait_seconds)
 
     def next_cooldown_wait(self, excluded: set[int] | None = None) -> float | None:
         excluded = excluded or set()
@@ -189,6 +201,20 @@ class TokenManager:
                 for index in self.ordered_indices()
                 if index not in excluded
             ]
+            if not waits:
+                return None
+            return min(waits)
+
+    def next_rate_wait(self, excluded: set[int] | None = None) -> float | None:
+        excluded = excluded or set()
+        with self.condition:
+            now = time.time()
+            waits = [
+                self.rate_wait_seconds(index, now)
+                for index in self.ordered_indices()
+                if index not in excluded
+            ]
+            waits = [wait for wait in waits if wait > 0]
             if not waits:
                 return None
             return min(waits)
@@ -225,13 +251,66 @@ def make_tool_id() -> str:
     return "toolu_" + uuid.uuid4().hex
 
 
-def normalize_endpoint(endpoint: str) -> str:
+def normalize_provider_mode(value: str | None) -> str:
+    value = (value or "").strip().lower()
+    if value in ("openai", "openai-compatible", "chat-completions", "chat_completions"):
+        return "openai"
+    if value in ("anthropic", "anthropic-native", "messages", "claude"):
+        return "anthropic"
+    return "auto"
+
+
+def normalize_rate_limit_mode(value: str | None) -> str:
+    value = (value or "").strip().lower().replace("_", "-")
+    if value in ("fail-fast", "failfast", "fast-fail", "reject", "reject-local"):
+        return "fail-fast"
+    if value in ("off", "disable", "disabled", "none", "no", "0"):
+        return "off"
+    return "wait"
+
+
+def looks_like_anthropic_endpoint(endpoint: str) -> bool:
+    parsed = urllib.parse.urlparse(endpoint.strip())
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.rstrip("/")
+    if host in ("api.anthropic.com", "api.claude.com") or host.endswith(".anthropic.com"):
+        return True
+    return path.endswith("/messages")
+
+
+def resolve_provider_mode(value: str | None, endpoint: str) -> str:
+    mode = normalize_provider_mode(value)
+    if mode != "auto":
+        return mode
+    return "anthropic" if looks_like_anthropic_endpoint(endpoint) else "openai"
+
+
+def normalize_openai_endpoint(endpoint: str) -> str:
     endpoint = endpoint.strip().rstrip("/")
     if endpoint.endswith("/chat/completions"):
         return endpoint
     if endpoint.endswith("/v1"):
         return endpoint + "/chat/completions"
     return endpoint.rstrip("/") + "/v1/chat/completions"
+
+
+def normalize_endpoint(endpoint: str) -> str:
+    return normalize_openai_endpoint(endpoint)
+
+
+def normalize_anthropic_endpoint(endpoint: str) -> str:
+    endpoint = endpoint.strip().rstrip("/")
+    if endpoint.endswith("/messages"):
+        return endpoint
+    if endpoint.endswith("/v1"):
+        return endpoint + "/messages"
+    return endpoint.rstrip("/") + "/v1/messages"
+
+
+def normalize_provider_endpoint(endpoint: str, provider_mode: str) -> str:
+    if provider_mode == "anthropic":
+        return normalize_anthropic_endpoint(endpoint)
+    return normalize_openai_endpoint(endpoint)
 
 
 def split_api_keys(value: str) -> list[str]:
@@ -255,6 +334,10 @@ def load_api_keys_from_env() -> list[str]:
     if multi:
         return split_api_keys(multi)
     single = os.environ.get("NVIDIA_API_KEY", "").strip()
+    if single:
+        return [single]
+
+    single = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     return [single] if single else []
 
 
@@ -272,6 +355,10 @@ def load_model_from_env() -> str:
         return model
     model = os.environ.get("NVIDIA_NIM_MODEL", "").strip()
     return model or DEFAULT_MODEL
+
+
+def load_provider_mode_from_env() -> str:
+    return normalize_provider_mode(os.environ.get("NVIDIACLAUDE_PROVIDER_MODE", "auto"))
 
 
 def is_rate_limit_error(error: ProviderError) -> bool:
@@ -529,6 +616,40 @@ def build_openai_payload(body: dict[str, Any], config: ProxyConfig) -> dict[str,
     return payload
 
 
+def build_anthropic_payload(body: dict[str, Any], config: ProxyConfig) -> dict[str, Any]:
+    payload = dict(body)
+    payload["model"] = config.model
+    payload["stream"] = bool(body.get("stream"))
+    return payload
+
+
+def provider_headers(
+    config: ProxyConfig,
+    payload: dict[str, Any],
+    token_index: int,
+    extra_headers: dict[str, str] | None = None,
+) -> dict[str, str]:
+    accept = "text/event-stream" if payload.get("stream") else "application/json"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": accept,
+        "User-Agent": "nvidiaclaude/1.0",
+    }
+    if config.provider_mode == "anthropic":
+        headers["x-api-key"] = config.api_keys[token_index]
+        headers["anthropic-version"] = config.anthropic_version
+        if extra_headers:
+            for key, value in extra_headers.items():
+                normalized = key.lower()
+                if normalized.startswith("anthropic-") and value:
+                    headers[normalized] = value
+        headers["x-api-key"] = config.api_keys[token_index]
+        return headers
+
+    headers["Authorization"] = f"Bearer {config.api_keys[token_index]}"
+    return headers
+
+
 def anthropic_usage(openai_usage: dict[str, Any] | None) -> dict[str, int]:
     openai_usage = openai_usage or {}
     return {
@@ -600,17 +721,17 @@ def convert_openai_response(data: dict[str, Any], model: str) -> dict[str, Any]:
     }
 
 
-def provider_request(config: ProxyConfig, payload: dict[str, Any], token_index: int) -> Any:
+def provider_request(
+    config: ProxyConfig,
+    payload: dict[str, Any],
+    token_index: int,
+    extra_headers: dict[str, str] | None = None,
+) -> Any:
     body = json_dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         config.endpoint,
         data=body,
-        headers={
-            "Authorization": f"Bearer {config.api_keys[token_index]}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream" if payload.get("stream") else "application/json",
-            "User-Agent": "nvidiaclaude/1.0",
-        },
+        headers=provider_headers(config, payload, token_index, extra_headers),
         method="POST",
     )
     try:
@@ -623,7 +744,11 @@ def provider_request(config: ProxyConfig, payload: dict[str, Any], token_index: 
         raise ProviderError(502, str(error.reason)) from error
 
 
-def provider_request_with_failover(config: ProxyConfig, payload: dict[str, Any]) -> tuple[Any, int]:
+def provider_request_with_failover(
+    config: ProxyConfig,
+    payload: dict[str, Any],
+    extra_headers: dict[str, str] | None = None,
+) -> tuple[Any, int]:
     attempts: list[str] = []
     rate_limited_attempts = 0
     attempted: set[int] = set()
@@ -633,7 +758,10 @@ def provider_request_with_failover(config: ProxyConfig, payload: dict[str, Any])
         if token_index is None:
             break
         try:
-            response = provider_request(config, payload, token_index)
+            if extra_headers:
+                response = provider_request(config, payload, token_index, extra_headers)
+            else:
+                response = provider_request(config, payload, token_index)
             config.token_manager.mark_success(token_index)
             return response, token_index
         except ProviderError as error:
@@ -672,6 +800,17 @@ def provider_request_with_failover(config: ProxyConfig, payload: dict[str, Any])
                 "All configured provider API tokens are currently cooling down "
                 f"or rate limited; next token may be available in {wait_seconds:.1f}s.",
             )
+        rate_wait_seconds = config.token_manager.next_rate_wait()
+        if (
+            config.rate_limit_mode == "fail-fast"
+            and rate_wait_seconds is not None
+            and rate_wait_seconds > 0
+        ):
+            raise ProviderError(
+                429,
+                "Local provider request rate limit is full; "
+                f"retry in {rate_wait_seconds:.1f}s or switch rate-limit mode.",
+            )
     if attempts and rate_limited_attempts == len(attempts):
         raise ProviderError(
             last_token_failure_status,
@@ -687,10 +826,11 @@ def stream_provider(
     config: ProxyConfig,
     payload: dict[str, Any],
     events: queue.Queue[tuple[str, Any]],
+    extra_headers: dict[str, str] | None = None,
 ) -> None:
     token_index: int | None = None
     try:
-        response, token_index = provider_request_with_failover(config, payload)
+        response, token_index = provider_request_with_failover(config, payload, extra_headers)
         with response:
             for raw_line in response:
                 events.put(("line", (raw_line, token_index)))
@@ -759,6 +899,14 @@ class NvidiaClaudeHandler(BaseHTTPRequestHandler):
         self.wfile.write(f"data: {json_dumps(data)}\n\n".encode("utf-8"))
         self.wfile.flush()
 
+    def upstream_anthropic_headers(self) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        for key, value in self.headers.items():
+            normalized = key.lower()
+            if normalized.startswith("anthropic-") and value:
+                headers[normalized] = value
+        return headers
+
     def do_GET(self) -> None:
         path = urllib.parse.urlparse(self.path).path
         if path in ("/", "/healthz"):
@@ -766,6 +914,8 @@ class NvidiaClaudeHandler(BaseHTTPRequestHandler):
                 "ok": True,
                 "model": self.config.model,
                 "token_count": len(self.config.api_keys),
+                "provider_mode": self.config.provider_mode,
+                "rate_limit_mode": self.config.rate_limit_mode,
                 "rate_limit_scope": self.config.rate_limit_scope,
             })
             return
@@ -801,6 +951,10 @@ class NvidiaClaudeHandler(BaseHTTPRequestHandler):
         self.send_error_json(404, f"Unknown endpoint: {path}", "not_found_error")
 
     def handle_messages(self, body: dict[str, Any]) -> None:
+        if self.config.provider_mode == "anthropic":
+            self.handle_anthropic_messages(body)
+            return
+
         payload = build_openai_payload(body, self.config)
         if payload.get("stream"):
             self.handle_streaming_message(payload)
@@ -818,6 +972,94 @@ class NvidiaClaudeHandler(BaseHTTPRequestHandler):
             return
 
         self.send_json(200, convert_openai_response(data, self.config.model))
+
+    def handle_anthropic_messages(self, body: dict[str, Any]) -> None:
+        payload = build_anthropic_payload(body, self.config)
+        extra_headers = self.upstream_anthropic_headers()
+        if payload.get("stream"):
+            self.handle_anthropic_streaming_message(payload, extra_headers)
+            return
+
+        try:
+            response, _token_index = provider_request_with_failover(
+                self.config,
+                payload,
+                extra_headers,
+            )
+            with response:
+                data = json.loads(response.read().decode("utf-8"))
+        except ProviderError as error:
+            self.send_error_json(error.status, f"Provider error: {error.message}")
+            return
+        except Exception as error:
+            self.send_error_json(502, f"Provider request failed: {error}")
+            return
+
+        self.send_json(200, data)
+
+    def handle_anthropic_streaming_message(
+        self,
+        payload: dict[str, Any],
+        extra_headers: dict[str, str],
+    ) -> None:
+        try:
+            response, token_index = provider_request_with_failover(
+                self.config,
+                payload,
+                extra_headers,
+            )
+        except ProviderError as error:
+            self.send_error_json(error.status, f"Provider error: {error.message}")
+            return
+        except Exception as error:
+            self.send_error_json(502, f"Provider request failed: {error}")
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        try:
+            with response:
+                for raw_line in response:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if line.startswith("data:"):
+                        chunk_text = line[5:].strip()
+                        try:
+                            chunk = json.loads(chunk_text)
+                        except json.JSONDecodeError:
+                            chunk = None
+                        if isinstance(chunk, dict) and isinstance(chunk.get("error"), dict):
+                            try:
+                                status = int(chunk["error"].get("status") or 0)
+                            except (TypeError, ValueError):
+                                status = 0
+                            provider_error = ProviderError(
+                                status,
+                                str(chunk["error"].get("message") or chunk["error"]),
+                            )
+                            if is_rate_limit_error(provider_error):
+                                self.config.token_manager.mark_token_limited(token_index)
+                            elif is_token_failover_error(provider_error):
+                                self.config.token_manager.mark_token_limited(token_index)
+                    self.wfile.write(raw_line)
+                    self.wfile.flush()
+        except BrokenPipeError:
+            return
+        except Exception as error:
+            try:
+                self.send_sse("error", {
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": f"Provider stream failed: {error}",
+                    },
+                })
+            except BrokenPipeError:
+                return
 
     def handle_streaming_message(self, payload: dict[str, Any]) -> None:
         message_id = make_message_id()
@@ -1070,12 +1312,16 @@ def env_rate_limit_scope() -> str:
     return "global"
 
 
+def env_rate_limit_mode() -> str:
+    return normalize_rate_limit_mode(os.environ.get("NVIDIACLAUDE_RATE_LIMIT_MODE", "wait"))
+
+
 def main() -> int:
     args = parse_args()
     api_keys = load_api_keys_from_env()
     if not api_keys:
         print(
-            "NVIDIACLAUDE_API_KEY(S) or NVIDIA_API_KEY(S) is required.",
+            "NVIDIACLAUDE_API_KEY(S), NVIDIA_API_KEY(S), or ANTHROPIC_API_KEY is required.",
             file=sys.stderr,
         )
         return 1
@@ -1086,13 +1332,16 @@ def main() -> int:
     )
     rate_limit_rpm = env_float("NVIDIACLAUDE_RATE_LIMIT_RPM", 38.0)
     rate_limit_scope = env_rate_limit_scope()
+    rate_limit_mode = env_rate_limit_mode()
     rate_limit_window_seconds = max(
         0.001,
         env_float("NVIDIACLAUDE_RATE_LIMIT_WINDOW_SECONDS", 60.0),
     )
+    raw_endpoint = load_endpoint_from_env()
+    provider_mode = resolve_provider_mode(load_provider_mode_from_env(), raw_endpoint)
 
     config = ProxyConfig(
-        endpoint=normalize_endpoint(load_endpoint_from_env()),
+        endpoint=normalize_provider_endpoint(raw_endpoint, provider_mode),
         api_keys=api_keys,
         model=load_model_from_env(),
         timeout=args.timeout,
@@ -1107,7 +1356,10 @@ def main() -> int:
             rate_limit_rpm,
             rate_limit_scope,
             rate_limit_window_seconds,
+            rate_limit_mode,
         ),
+        provider_mode=provider_mode,
+        rate_limit_mode=rate_limit_mode,
     )
 
     server = ThreadingHTTPServer((args.host, args.port), make_handler(config))
@@ -1120,8 +1372,10 @@ def main() -> int:
 
     print(
         f"nvidiaclaude: proxy listening on {args.host}:{port} with {len(api_keys)} token(s); "
+        f"provider {provider_mode}; "
         f"token cooldown {token_cooldown_seconds:g}s; "
-        f"rate limit {rate_limit_scope} {rate_limit_rpm:g}/{rate_limit_window_seconds:g}s",
+        f"rate limit {rate_limit_mode} {rate_limit_scope} "
+        f"{rate_limit_rpm:g}/{rate_limit_window_seconds:g}s",
         file=sys.stderr,
     )
     try:

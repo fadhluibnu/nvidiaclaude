@@ -6,7 +6,8 @@
 #   3. $env:NVIDIACLAUDE_API_KEY  - single key, saved for next time
 #   4. $env:NVIDIA_API_KEYS       - legacy comma-separated keys, saved for next time
 #   5. $env:NVIDIA_API_KEY        - legacy single key, saved for next time
-#   6. interactive prompt         - asks for a key if needed
+#   6. $env:ANTHROPIC_API_KEY     - Anthropic-compatible single key
+#   7. interactive prompt         - asks for a key if needed
 
 $ErrorActionPreference = 'Stop'
 
@@ -14,6 +15,11 @@ $ConfigDir       = Join-Path $env:APPDATA 'nvidiaclaude'
 $ConfigFile      = Join-Path $ConfigDir 'config'
 $DefaultEndpoint = 'https://integrate.api.nvidia.com/v1/chat/completions'
 $DefaultModel    = 'minimaxai/minimax-m3'
+$DefaultProviderMode = 'auto'
+$DefaultRateLimitMode = 'wait'
+$DefaultRateLimitRpm = '38'
+$DefaultRateLimitScope = 'global'
+$DefaultRateLimitWindowSeconds = '60'
 $LocalAuthToken  = 'nvidiaclaude-local'
 $DefaultInstallRef = 'main'
 
@@ -140,6 +146,10 @@ function Get-EnvKeys {
     $key = $env:NVIDIA_API_KEY.Trim()
     if ($key) { return @($key) }
   }
+  if ($env:ANTHROPIC_API_KEY) {
+    $key = $env:ANTHROPIC_API_KEY.Trim()
+    if ($key) { return @($key) }
+  }
   return @()
 }
 
@@ -253,6 +263,114 @@ function Get-ConfiguredEndpoint {
   $endpoint = Get-ConfigValue 'NVIDIA_NIM_ENDPOINT'
   if ($endpoint) { return $endpoint.Trim() }
   return $DefaultEndpoint
+}
+
+function Normalize-ProviderMode([string]$Mode) {
+  if ($null -eq $Mode) { return 'auto' }
+  $value = $Mode.Trim().ToLowerInvariant()
+  switch ($value) {
+    { $_ -in @('openai', 'openai-compatible', 'chat-completions', 'chat_completions') } { return 'openai' }
+    { $_ -in @('anthropic', 'anthropic-native', 'messages', 'claude') } { return 'anthropic' }
+    { $_ -in @('auto', '') } { return 'auto' }
+    default { return $null }
+  }
+}
+
+function Save-ProviderMode([string]$Mode) {
+  $mode = Normalize-ProviderMode $Mode
+  if (-not $mode) {
+    Write-Host 'Provider mode must be one of: auto, openai, anthropic.'
+    exit 1
+  }
+  Set-ConfigValue 'NVIDIACLAUDE_PROVIDER_MODE' $mode
+  Write-Host "Provider mode saved to $ConfigFile"
+}
+
+function Get-ConfiguredProviderMode {
+  if ($env:NVIDIACLAUDE_PROVIDER_MODE) {
+    $mode = Normalize-ProviderMode $env:NVIDIACLAUDE_PROVIDER_MODE
+    if ($mode) { return $mode }
+    return $DefaultProviderMode
+  }
+  $stored = Get-ConfigValue 'NVIDIACLAUDE_PROVIDER_MODE'
+  if ($stored) {
+    $mode = Normalize-ProviderMode $stored
+    if ($mode) { return $mode }
+  }
+  return $DefaultProviderMode
+}
+
+function Normalize-RateLimitMode([string]$Mode) {
+  if ($null -eq $Mode) { return 'wait' }
+  $value = $Mode.Trim().ToLowerInvariant().Replace('_', '-')
+  switch ($value) {
+    { $_ -in @('wait', '') } { return 'wait' }
+    { $_ -in @('fail-fast', 'failfast', 'fast-fail', 'reject', 'reject-local') } { return 'fail-fast' }
+    { $_ -in @('off', 'disable', 'disabled', 'none', 'no', '0') } { return 'off' }
+    default { return $null }
+  }
+}
+
+function Test-NonNegativeNumber([string]$Value) {
+  return $Value -match '^([0-9]+([.][0-9]+)?|[.][0-9]+)$'
+}
+
+function Get-ConfiguredRateLimitMode {
+  if ($env:NVIDIACLAUDE_RATE_LIMIT_MODE) {
+    $mode = Normalize-RateLimitMode $env:NVIDIACLAUDE_RATE_LIMIT_MODE
+    if ($mode) { return $mode }
+    return $DefaultRateLimitMode
+  }
+  $stored = Get-ConfigValue 'NVIDIACLAUDE_RATE_LIMIT_MODE'
+  if ($stored) {
+    $mode = Normalize-RateLimitMode $stored
+    if ($mode) { return $mode }
+  }
+  return $DefaultRateLimitMode
+}
+
+function Get-ConfiguredRateLimitRpm {
+  if ($env:NVIDIACLAUDE_RATE_LIMIT_RPM) { return $env:NVIDIACLAUDE_RATE_LIMIT_RPM.Trim() }
+  $stored = Get-ConfigValue 'NVIDIACLAUDE_RATE_LIMIT_RPM'
+  if ($stored) { return $stored.Trim() }
+  return $DefaultRateLimitRpm
+}
+
+function Get-ConfiguredRateLimitScope {
+  if ($env:NVIDIACLAUDE_RATE_LIMIT_SCOPE) { return $env:NVIDIACLAUDE_RATE_LIMIT_SCOPE.Trim() }
+  return $DefaultRateLimitScope
+}
+
+function Get-ConfiguredRateLimitWindowSeconds {
+  if ($env:NVIDIACLAUDE_RATE_LIMIT_WINDOW_SECONDS) { return $env:NVIDIACLAUDE_RATE_LIMIT_WINDOW_SECONDS.Trim() }
+  return $DefaultRateLimitWindowSeconds
+}
+
+function Save-RateLimitMode([string]$Mode, [string]$Rpm) {
+  $mode = Normalize-RateLimitMode $Mode
+  if (-not $mode) {
+    Write-Host 'Rate-limit mode must be one of: wait, fail-fast, off.'
+    exit 1
+  }
+  if ($Rpm) {
+    $rpm = $Rpm.Trim()
+    if (-not (Test-NonNegativeNumber $rpm)) {
+      Write-Host 'RPM must be a non-negative number.'
+      exit 1
+    }
+  }
+  Set-ConfigValue 'NVIDIACLAUDE_RATE_LIMIT_MODE' $mode
+  if ($Rpm) {
+    Set-ConfigValue 'NVIDIACLAUDE_RATE_LIMIT_RPM' $rpm
+  }
+  Write-Host "Rate-limit mode saved to $ConfigFile"
+}
+
+function Show-RateLimitStatus {
+  Write-Host "mode=$(Get-ConfiguredRateLimitMode)"
+  Write-Host "rpm=$(Get-ConfiguredRateLimitRpm)"
+  Write-Host "scope=$(Get-ConfiguredRateLimitScope)"
+  Write-Host "window_seconds=$(Get-ConfiguredRateLimitWindowSeconds)"
 }
 
 function Invoke-Setup {
@@ -576,6 +694,33 @@ Endpoint
       Remove the stored endpoint and return to the default endpoint:
       $DefaultEndpoint
 
+Provider mode
+  nvidiaclaude provider-mode
+      Show provider mode new runs will use: auto, openai, or anthropic.
+
+  nvidiaclaude provider-mode <auto|openai|anthropic>
+      Save provider mode. auto detects Anthropic-native endpoints and uses
+      OpenAI-compatible conversion for other endpoints.
+
+  nvidiaclaude reset-provider-mode
+      Remove the stored provider mode and return to auto.
+
+Rate limit
+  nvidiaclaude rate-limit status
+      Show local proactive rate-limit settings.
+
+  nvidiaclaude rate-limit wait [RPM]
+      Wait silently when the local RPM bucket is full. This is the default.
+
+  nvidiaclaude rate-limit fail-fast [RPM]
+      Return a local 429 instead of pending when the local RPM bucket is full.
+
+  nvidiaclaude rate-limit off
+      Disable local proactive throttling. Provider 429s may still happen.
+
+  nvidiaclaude rate-limit reset
+      Return to default wait mode and default RPM.
+
 Maintenance
   nvidiaclaude update
       Re-run the installer from the selected install branch.
@@ -603,6 +748,10 @@ Environment overrides
   NVIDIA_API_KEYS
       Legacy alias for NVIDIACLAUDE_API_KEYS.
 
+  ANTHROPIC_API_KEY
+      Anthropic-compatible single-token fallback if no nvidiaclaude or legacy
+      NVIDIA token is configured.
+
   NVIDIACLAUDE_MODEL
       Override the configured model for one run.
 
@@ -616,6 +765,9 @@ Environment overrides
   NVIDIA_NIM_ENDPOINT
       Legacy alias for NVIDIACLAUDE_API_ENDPOINT.
 
+  NVIDIACLAUDE_PROVIDER_MODE
+      Provider mode: auto, openai, or anthropic. Default: auto.
+
   NVIDIACLAUDE_STREAM_PING_SECONDS
       Send Anthropic SSE ping events while waiting for provider stream
       chunks. Default: 2. Set to 0 to disable.
@@ -626,6 +778,10 @@ Environment overrides
   NVIDIACLAUDE_RATE_LIMIT_RPM
       Maximum provider requests per shared rate-limit window. Default: 38.
       Set to 0 to disable proactive throttling.
+
+  NVIDIACLAUDE_RATE_LIMIT_MODE
+      Local proactive rate-limit behavior: wait, fail-fast, or off.
+      Default: wait.
 
   NVIDIACLAUDE_RATE_LIMIT_SCOPE
       Rate-limit scope: global or per-token. Default: global.
@@ -701,6 +857,55 @@ if ($args.Count -ge 1) {
       Write-Host "Stored endpoint removed. New runs will use default endpoint: $DefaultEndpoint"
       exit 0
     }
+    '^(provider-mode|--provider-mode)$' {
+      if ($args.Count -lt 2) {
+        Write-Host (Get-ConfiguredProviderMode)
+      } else {
+        Save-ProviderMode $args[1]
+        Write-Host "Done. New runs will use provider mode: $(Get-ConfiguredProviderMode)"
+      }
+      exit 0
+    }
+    '^(reset-provider-mode|--reset-provider-mode)$' {
+      Remove-ConfigValue 'NVIDIACLAUDE_PROVIDER_MODE'
+      Write-Host "Stored provider mode removed. New runs will use provider mode: $DefaultProviderMode"
+      exit 0
+    }
+    '^(rate-limit|--rate-limit)$' {
+      $action = if ($args.Count -ge 2) { $args[1] } else { 'status' }
+      switch -Regex ($action) {
+        '^(status)?$' {
+          Show-RateLimitStatus
+          exit 0
+        }
+        '^(wait|fail-fast|failfast|fast-fail|reject|reject-local|off|disable|disabled|none|no|0)$' {
+          $rpm = if ($args.Count -ge 3) { $args[2] } else { $null }
+          Save-RateLimitMode $action $rpm
+          Write-Host "Done. New runs will use rate-limit mode: $(Get-ConfiguredRateLimitMode)"
+          exit 0
+        }
+        '^(reset)$' {
+          Remove-ConfigValue 'NVIDIACLAUDE_RATE_LIMIT_MODE'
+          Remove-ConfigValue 'NVIDIACLAUDE_RATE_LIMIT_RPM'
+          Write-Host "Stored rate-limit settings removed. New runs will use $DefaultRateLimitMode $DefaultRateLimitRpm RPM."
+          exit 0
+        }
+        '^(help|--help|-h)$' {
+          Write-Host 'Usage:'
+          Write-Host '  nvidiaclaude rate-limit status'
+          Write-Host '  nvidiaclaude rate-limit wait [RPM]'
+          Write-Host '  nvidiaclaude rate-limit fail-fast [RPM]'
+          Write-Host '  nvidiaclaude rate-limit off'
+          Write-Host '  nvidiaclaude rate-limit reset'
+          exit 0
+        }
+        default {
+          Write-Host "Unknown rate-limit command: $action"
+          Write-Host "Run 'nvidiaclaude rate-limit help' for usage."
+          exit 1
+        }
+      }
+    }
     '^(reset|--reset)$' {
       Remove-AllKeys
       Write-Host 'All stored tokens removed.'
@@ -754,6 +959,9 @@ $env:NVIDIACLAUDE_API_ENDPOINT = Get-ConfiguredEndpoint
 $env:NVIDIA_NIM_ENDPOINT = $env:NVIDIACLAUDE_API_ENDPOINT
 $env:NVIDIACLAUDE_MODEL = Get-ConfiguredModel
 $env:NVIDIA_NIM_MODEL = $env:NVIDIACLAUDE_MODEL
+$env:NVIDIACLAUDE_PROVIDER_MODE = Get-ConfiguredProviderMode
+$env:NVIDIACLAUDE_RATE_LIMIT_MODE = Get-ConfiguredRateLimitMode
+$env:NVIDIACLAUDE_RATE_LIMIT_RPM = Get-ConfiguredRateLimitRpm
 
 $proxy = $null
 $exitCode = 1
